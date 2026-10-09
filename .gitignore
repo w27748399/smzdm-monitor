@@ -1,0 +1,13 @@
+# 本地私密配置：绝不要提交（推送密钥都在里面）
+config.json
+
+# 注意：state.json 是【故意纳入版本管理】的。
+# GitHub Actions 的 runner 是一次性的，去重状态必须靠 git 回写仓库才能跨次运行持久化。
+# 里面只有已推送过的爆料 ID，不含任何凭据，可以安全提交。
+
+state.json.tmp
+__pycache__/
+*.pyc
+.venv/
+venv/
+run.log

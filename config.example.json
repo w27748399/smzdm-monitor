@@ -1,0 +1,28 @@
+{
+  "_说明": "复制本文件为 config.json 后按需修改；环境变量优先级高于本文件。",
+  "_推送通道说明": "PUSH_CHANNEL 可选：wecom / wxpusher / serverchan / bark / telegram / webhook / email，留空则只在控制台打印",
+  "_GitHub部署说明": "部署到 GitHub Actions 时【不要】用本文件，改在仓库 Settings→Secrets and variables→Actions 里添加，键名与本文件完全一致；POLL_INTERVAL 建议设 60。本文件已被 .gitignore 排除，不会上传。",
+
+  "MEMBER_ID": "9687682701",
+  "POLL_INTERVAL": "10",
+  "PORT": "8899",
+  "FIRST_RUN_PUSH": "0",
+
+  "PUSH_CHANNEL": "wecom",
+  "WECOM_WEBHOOK": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=在这里填你的key",
+
+  "WXPUSHER_TOKEN": "",
+  "WXPUSHER_UID": "",
+  "SERVERCHAN_KEY": "",
+  "BARK_URL": "",
+  "TELEGRAM_TOKEN": "",
+  "TELEGRAM_CHAT": "",
+  "WEBHOOK_URL": "",
+
+  "EMAIL_USER": "",
+  "EMAIL_PASS": "",
+  "EMAIL_TO": "",
+  "SMTP_HOST": "",
+  "SMTP_PORT": "",
+  "SMTP_SSL": ""
+}
