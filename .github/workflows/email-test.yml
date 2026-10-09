@@ -16,18 +16,57 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: 安装依赖
-        run: pip install -r requirements.txt
-
-      - name: 发一封测试邮件并输出结果
+      - name: 多端口诊断 SMTP 认证
         env:
           PYTHONUNBUFFERED: '1'
-          NO_HEALTH_SERVER: '1'
-          PUSH_CHANNEL: ${{ secrets.PUSH_CHANNEL }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_SSL: ${{ secrets.SMTP_SSL }}
-        run: python monitor.py --test-push
+        run: python - << 'PYEOF'
+import os, smtplib, ssl, sys
+
+USER = os.environ.get('EMAIL_USER', '')
+PASS = os.environ.get('EMAIL_PASS', '')
+TO   = os.environ.get('EMAIL_TO', '') or USER
+
+print('USER =', USER[:4] + '***' + USER[-8:] if len(USER) > 12 else '(短)')
+print('PASS 长度 =', len(PASS), '| 首尾字符 =', (PASS[:2] + '***' + PASS[-2:]) if len(PASS) >= 4 else '(?)')
+print('TO =', TO[:4] + '***' + TO[-8:] if len(TO) > 12 else '(短)')
+
+def try_ssl(host, port):
+    print(f'--- 测试 {host}:{port} SSL/465式 ---')
+    try:
+        s = smtplib.SMTP_SSL(host, port, timeout=15, context=ssl.create_default_context())
+        code, msg = s.login(USER, PASS)
+        print('    认证成功:', code, msg)
+        s.quit()
+        return True
+    except Exception as e:
+        print('    失败:', repr(e)[:200])
+        return False
+
+def try_starttls(host, port):
+    print(f'--- 测试 {host}:{port} STARTTLS/587式 ---')
+    try:
+        s = smtplib.SMTP(host, port, timeout=15)
+        s.ehlo()
+        s.starttls(context=ssl.create_default_context())
+        code, msg = s.login(USER, PASS)
+        print('    认证成功:', code, msg)
+        s.quit()
+        return True
+    except Exception as e:
+        print('    失败:', repr(e)[:200])
+        return False
+
+results = []
+results.append(('smtp.qq.com 465 SSL', try_ssl('smtp.qq.com', 465)))
+results.append(('smtp.qq.com 587 STARTTLS', try_starttls('smtp.qq.com', 587)))
+results.append(('smtp.163.com 465 SSL', try_ssl('smtp.163.com', 465)))
+results.append(('smtp.163.com 994 SSL', try_ssl('smtp.163.com', 994)))
+
+print()
+print('===== 汇总 =====')
+for name, ok in results:
+    print(('✅' if ok else '❌'), name)
+PYEOF
