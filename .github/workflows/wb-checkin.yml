@@ -1,0 +1,63 @@
+name: WorkBuddy Checkin
+
+on:
+  schedule:
+    # UTC 01:20 / 13:20 = 北京时间 09:20 / 21:20，一天两次，幂等
+    - cron: '20 1,13 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: wb-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Do checkin
+        id: checkin
+        env:
+          WB_CHECKIN_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
+          WB_CHECKIN_UID: ${{ secrets.WB_CHECKIN_UID }}
+          GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        run: python3 wb_checkin.py
+
+      - name: Alert on failure (email)
+        if: failure()
+        shell: python
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_SSL: ${{ secrets.SMTP_SSL }}
+          GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          import os, smtplib, ssl
+          from email.mime.text import MIMEText
+          from email.header import Header
+          user = os.environ["EMAIL_USER"]; pwd = os.environ["EMAIL_PASS"]; to = os.environ["EMAIL_TO"]
+          host = os.environ.get("SMTP_HOST", "smtp.qq.com"); port = int(os.environ.get("SMTP_PORT", "465"))
+          use_ssl = os.environ.get("SMTP_SSL", "true").lower() in ("1", "true", "yes")
+          run_url = os.environ.get("GH_RUN_URL", "")
+          body = "WorkBuddy 云端签到失败！\n\n" \
+                 "可能原因：token 过期/失效、接口变更、GitHub 出网异常。\n\n" \
+                 "处理办法：本地运行 memscan_sign.py 重新提取 token 并更新仓库 Secrets。\n\n" \
+                 "运行日志: " + run_url + "\n"
+          msg = MIMEText(body, "plain", "utf-8")
+          msg["Subject"] = Header("【告警】WorkBuddy 云端签到失败", "utf-8")
+          msg["From"] = user
+          msg["To"] = to
+          if use_ssl:
+            s = smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30)
+          else:
+            s = smtplib.SMTP(host, port, timeout=30); s.starttls(context=ssl.create_default_context())
+          s.login(user, pwd)
+          s.sendmail(user, [to], msg.as_string())
+          s.quit()
+          print("alert email sent to", to)
