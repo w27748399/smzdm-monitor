@@ -26,8 +26,8 @@ jobs:
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
         run: python3 wb_checkin.py
 
-      - name: Alert on failure (email)
-        if: failure()
+      - name: Email daily result
+        if: always()
         shell: python
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
@@ -37,20 +37,35 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_SSL: ${{ secrets.SMTP_SSL }}
           GH_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_EVENT: ${{ github.event_name }}
+          GH_CRON_OK: ${{ job.status }}
         run: |
-          import os, smtplib, ssl
+          import os, smtplib, ssl, datetime
           from email.mime.text import MIMEText
           from email.header import Header
           user = os.environ["EMAIL_USER"]; pwd = os.environ["EMAIL_PASS"]; to = os.environ["EMAIL_TO"]
           host = os.environ.get("SMTP_HOST", "smtp.qq.com"); port = int(os.environ.get("SMTP_PORT", "465"))
           use_ssl = os.environ.get("SMTP_SSL", "true").lower() in ("1", "true", "yes")
+          now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+          # 读签到结果文件（签到 step 未跑到时兜底）
+          title, status, detail = "⚠️ 未执行到签到步骤", "skipped", "workflow 在签到 step 之前就中断了（checkout/环境问题），请查看运行日志。"
+          try:
+            with open("checkin_result.txt", encoding="utf-8") as f:
+              for line in f:
+                if line.startswith("status="): status = line.split("=",1)[1].strip()
+                elif line.startswith("title="): title = line.split("=",1)[1].strip()
+                elif line.startswith("detail="): detail = line.split("=",1)[1].strip()
+          except FileNotFoundError:
+            pass
           run_url = os.environ.get("GH_RUN_URL", "")
-          body = "WorkBuddy 云端签到失败！\n\n" \
-                 "可能原因：token 过期/失效、接口变更、GitHub 出网异常。\n\n" \
-                 "处理办法：本地运行 memscan_sign.py 重新提取 token 并更新仓库 Secrets。\n\n" \
+          body = "WorkBuddy 每日签到结果\n" + "=" * 32 + "\n" \
+                 "时间: " + now + " (北京时间)\n" \
+                 "结果: " + title + "\n" \
+                 "详情: " + detail + "\n" \
+                 "触发: " + os.environ.get("GH_EVENT", "?") + "\n" \
                  "运行日志: " + run_url + "\n"
           msg = MIMEText(body, "plain", "utf-8")
-          msg["Subject"] = Header("【告警】WorkBuddy 云端签到失败", "utf-8")
+          msg["Subject"] = Header("WorkBuddy 签到 " + title + " @ " + now, "utf-8")
           msg["From"] = user
           msg["To"] = to
           if use_ssl:
@@ -60,4 +75,4 @@ jobs:
           s.login(user, pwd)
           s.sendmail(user, [to], msg.as_string())
           s.quit()
-          print("alert email sent to", to)
+          print("daily result email sent:", title, "->", to)

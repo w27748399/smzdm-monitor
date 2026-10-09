@@ -83,12 +83,26 @@ def summary(line):
             f.write(line + "\n")
 
 
+RESULT_FILE = "checkin_result.txt"
+
+
+def write_result(status, title, detail):
+    """把签到结果落盘给邮件 step 读（status: ok/already/inactive/expired/failed）"""
+    with open(RESULT_FILE, "w", encoding="utf-8") as f:
+        f.write("status=%s\ntitle=%s\ndetail=%s\n" % (status, title, detail))
+    p = os.environ.get("GITHUB_OUTPUT")
+    if p:
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("status=%s\ntitle=%s\n" % (status, title))
+
+
 def main():
     token = (os.environ.get("WB_CHECKIN_TOKEN") or "").strip()
     uid = (os.environ.get("WB_CHECKIN_UID") or "").strip()
     if not token or not uid:
         print("❌ 缺少 WB_CHECKIN_TOKEN / WB_CHECKIN_UID 环境变量")
         summary("### WorkBuddy 签到 ❌\n\n缺少 Secrets（WB_CHECKIN_TOKEN / WB_CHECKIN_UID）")
+        write_result("failed", "❌ 配置缺失", "缺少 Secrets（WB_CHECKIN_TOKEN / WB_CHECKIN_UID）")
         return 1
 
     hosts = []
@@ -133,10 +147,15 @@ def main():
                     print(tag)
                     summary("### WorkBuddy 签到 %s\n\n- 账号 uid: `%s`\n- 接口: `%s`\n- 响应: %s" % (
                         tag, uid, pth, res.get("message")))
+                    if res.get("already"):
+                        write_result("already", "☑️ 今日已签到", "响应：%s\n接口：%s" % (res.get("message"), pth))
+                    else:
+                        write_result("ok", "✅ 签到成功", "响应：%s\n接口：%s" % (res.get("message"), pth))
                     return 0
                 if res.get("inactive"):
                     print("ℹ️ 签到活动未开放（不算失败）")
                     summary("### WorkBuddy 签到 ℹ️ 活动未开放\n\n- 响应: %s" % res.get("message"))
+                    write_result("inactive", "ℹ️ 活动未开放", "响应：%s" % res.get("message"))
                     return 0
             else:
                 print("  !", url, "-> 非JSON响应 HTTP", status)
@@ -144,9 +163,11 @@ def main():
     if tried_expired:
         print("❌ token 已过期或无效 —— 需本地重新提取并更新 Secrets")
         summary("### WorkBuddy 签到 ❌ token 失效\n\n请本地运行 memscan_sign.py 重新提取 token 并更新仓库 Secrets。")
+        write_result("expired", "❌ token 已失效", "HTTP 401/403，接口拒绝。\n处理：本地运行 memscan_sign.py 重新提取 token 并更新仓库 Secrets。")
         return 2
     print("❌ 所有签到端点都未成功", last_line)
     summary("### WorkBuddy 签到 ❌ 全部端点失败\n\n- 最后: %s" % last_line)
+    write_result("failed", "❌ 全部端点失败", "最后响应：%s" % last_line)
     return 1
 
 
