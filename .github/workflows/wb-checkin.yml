@@ -44,8 +44,10 @@ jobs:
           from email.mime.text import MIMEText
           from email.header import Header
           user = os.environ["EMAIL_USER"]; pwd = os.environ["EMAIL_PASS"]; to = os.environ["EMAIL_TO"]
-          host = os.environ.get("SMTP_HOST", "smtp.qq.com"); port = int(os.environ.get("SMTP_PORT", "465"))
-          use_ssl = os.environ.get("SMTP_SSL", "true").lower() in ("1", "true", "yes")
+          host = (os.environ.get("SMTP_HOST") or "").strip() or "smtp.qq.com"
+          port_s = (os.environ.get("SMTP_PORT") or "").strip()
+          port = int(port_s) if port_s.isdigit() else 465
+          use_ssl = (os.environ.get("SMTP_SSL") or "true").strip().lower() in ("1", "true", "yes")
           now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
           # 读签到结果文件（签到 step 未跑到时兜底）
           title, status, detail = "⚠️ 未执行到签到步骤", "skipped", "workflow 在签到 step 之前就中断了（checkout/环境问题），请查看运行日志。"
