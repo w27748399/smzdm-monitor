@@ -9,7 +9,7 @@
 特性：
   * 纯 Python + requests，无框架，单文件
   * 本地常驻 / Docker / Koyeb / 任意 VPS 通用同一份代码
-  * 6 种推送通道：企业微信机器人 / WxPusher / Server酱 / Bark / Telegram / 自定义 Webhook
+  * 7 种推送通道：企业微信机器人 / WxPusher / Server酱 / Bark / Telegram / 自定义 Webhook / 邮件SMTP
   * 内置健康检查 HTTP 服务（云平台保活用，如 Koyeb 要求监听端口）
   * 首轮只建基线不推送，避免开机刷屏
 
@@ -29,8 +29,12 @@ import sys
 import json
 import time
 import html
+import smtplib
 import logging
 import threading
+from email.mime.text import MIMEText
+from email.header import Header
+from email.utils import formataddr
 from datetime import datetime, timezone, timedelta
 
 try:
@@ -54,7 +58,7 @@ _DEFAULTS = {
     "FIRST_RUN_PUSH": "0",                  # 首次运行是否推送历史（默认不推）
     "TIMEOUT": "15",                        # 单次请求超时（秒）
     "RETRY": "3",                           # 单轮失败重试次数
-    "PUSH_CHANNEL": "",                     # wecom / wxpusher / serverchan / bark / telegram / webhook
+    "PUSH_CHANNEL": "",                     # wecom / wxpusher / serverchan / bark / telegram / webhook / email
     "USER_AGENT": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -68,6 +72,13 @@ _DEFAULTS = {
     "TELEGRAM_TOKEN": "",                   # Telegram Bot Token
     "TELEGRAM_CHAT": "",                    # Telegram chat_id
     "WEBHOOK_URL": "",                      # 通用 Webhook
+    # --- 邮件通道（PUSH_CHANNEL=email 时生效）---
+    "EMAIL_USER": "",                       # 发件邮箱，如 xxx@qq.com
+    "EMAIL_PASS": "",                       # SMTP 授权码（不是邮箱登录密码！）
+    "EMAIL_TO": "",                         # 收件邮箱，留空 = 发给自己
+    "SMTP_HOST": "",                        # 留空则按邮箱域名自动推断
+    "SMTP_PORT": "",                        # 留空则自动（SSL 465 / STARTTLS 587）
+    "SMTP_SSL": "",                         # 留空自动；"0" 强制 STARTTLS，"1" 强制 SSL
 }
 
 
@@ -268,8 +279,80 @@ def push_item(item):
                      {"title": title, "price": price, "url": link,
                       "time": now_str(), "text": text}, "webhook")
 
+    if CHANNEL == "email":
+        return _send_email(item)
+
     log.warning("未知推送通道：%s", CHANNEL)
     return False
+
+
+# 常见邮箱 -> (SMTP 服务器, 端口, 是否 SSL)
+_SMTP_TABLE = {
+    "qq.com":      ("smtp.qq.com", 465, True),
+    "foxmail.com": ("smtp.qq.com", 465, True),
+    "163.com":     ("smtp.163.com", 465, True),
+    "126.com":     ("smtp.126.com", 465, True),
+    "sina.com":    ("smtp.sina.com", 465, True),
+    "sohu.com":    ("smtp.sohu.com", 465, True),
+    "gmail.com":   ("smtp.gmail.com", 465, True),
+    "outlook.com": ("smtp.office365.com", 587, False),
+    "hotmail.com": ("smtp.office365.com", 587, False),
+    "live.com":    ("smtp.office365.com", 587, False),
+}
+
+
+def _send_email(item):
+    """SMTP 发信。EMAIL_PASS 必须是『授权码』，不是邮箱登录密码。"""
+    user = (CFG["EMAIL_USER"] or "").strip()
+    password = (CFG["EMAIL_PASS"] or "").strip()
+    to = (CFG["EMAIL_TO"] or "").strip() or user
+    if not user or not password:
+        log.warning("推送失败[email]：EMAIL_USER / EMAIL_PASS 未配置")
+        return False
+
+    if CFG["SMTP_HOST"]:
+        host = CFG["SMTP_HOST"].strip()
+        port = int(CFG["SMTP_PORT"] or 465)
+        use_ssl = CFG["SMTP_SSL"] != "0"
+    else:
+        domain = user.split("@")[-1].lower()
+        host, port, use_ssl = _SMTP_TABLE.get(domain, ("", 465, True))
+        if not host:
+            log.warning("推送失败[email]：不认识的邮箱域名 %s，请手动配 SMTP_HOST", domain)
+            return False
+
+    title, price, link = item["title"], item["price"], item["url"]
+    body_html = (
+        '<div style="font-family:sans-serif;max-width:520px">'
+        '<h2 style="margin:0 0 8px">%s</h2>'
+        '<p style="margin:4px 0;color:#c0392b;font-size:15px">💰 价格：%s</p>'
+        '<p style="margin:12px 0"><a href="%s" style="background:#e74c3c;color:#fff;'
+        'padding:8px 18px;border-radius:4px;text-decoration:none">点此查看详情</a></p>'
+        '<p style="color:#999;font-size:12px">%s · 信小兔爆料监控</p></div>'
+    ) % (html.escape(title), html.escape(price or "—"), html.escape(link), now_str())
+
+    msg = MIMEText(body_html, "html", "utf-8")
+    msg["Subject"] = Header("爆料: %s%s" % (title, ("　" + price) if price else ""), "utf-8")
+    msg["From"] = formataddr((Header("信小兔爆料监控", "utf-8").encode(), user))
+    msg["To"] = to
+
+    try:
+        if use_ssl:
+            s = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT)
+        else:
+            s = smtplib.SMTP(host, port, timeout=TIMEOUT)
+            s.starttls()
+        try:
+            s.login(user, password)
+            s.sendmail(user, [x.strip() for x in to.split(",") if x.strip()],
+                       msg.as_string())
+        finally:
+            s.quit()
+        log.info("推送[email] 已发送 -> %s", to)
+        return True
+    except Exception as e:
+        log.warning("推送失败[email]：%s", e)
+        return False
 
 
 # ────────────────────── 健康检查 HTTP 服务 ──────────────────────
