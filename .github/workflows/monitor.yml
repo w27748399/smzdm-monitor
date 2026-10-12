@@ -15,7 +15,11 @@ name: 信小兔爆料监控
 on:
   schedule:
     # 注意：cron 用 UTC。这里只是"点火时间"，真正的节奏由 loop.sh 控制。
-    - cron: '0 */2 * * *'
+    # 每 30 分钟点一次火（而不是每 2h）：GitHub schedule 高峰期会延迟甚至
+    # 丢弃，实测 2h 一次点火出现过 1.5~4.5 小时断档；30min 一次能把断档
+    # 压到 ~30min 量级。concurrency 组保证同时只有一个接力在跑，多余点火
+    # 在队列里排队/被 GitHub 以"只保留最新 pending"合并，无副作用。
+    - cron: '*/30 * * * *'
   workflow_dispatch: # 支持在 Actions 页面手动点一下立刻启动
 
 concurrency:
@@ -50,7 +54,9 @@ jobs:
           PYTHONUNBUFFERED: '1'
           PYTHONIOENCODING: 'utf-8'
           NO_HEALTH_SERVER: '1' # Actions 里不需要健康检查端口
-          POLL_INTERVAL: '60' # 1 分钟一轮
+          # 300s = 5 分钟一轮：60s 高频连击会触发 smzdm 风控（对机房 IP 喂
+          # 冻结的旧缓存页，静默无新爆料）。实测 5 分钟 + keep-alive 拿实时页。
+          POLL_INTERVAL: '300'
           # ↓↓↓ 推送配置请到仓库 Settings → Secrets and variables → Actions 里添加
           #     没配任何一项也能跑，只是新爆料只打进 Actions 日志
           MEMBER_ID: ${{ secrets.MEMBER_ID }}

@@ -80,10 +80,12 @@ while :; do
 
     commit_state
 
-    # 对齐到下一个整点间隔，避免抓取耗时逐轮累积成漂移
+    # 对齐到下一个整点间隔，避免抓取耗时逐轮累积成漂移；
+    # 再加 0~44s 随机抖动，打散固定节拍的机器人特征（smzdm 风控取证教训）
     TARGET=$((NOW + INTERVAL))
     ELAPSED=$(( $(date +%s) - NOW ))
     WAIT=$((TARGET - NOW - ELAPSED))
+    WAIT=$((WAIT + RANDOM % 45))
     [ "$WAIT" -gt 0 ] && sleep "$WAIT"
 done
 

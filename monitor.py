@@ -180,8 +180,12 @@ def fetch(url):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Referer": "https://www.smzdm.com/",
-        "Connection": "close",
     }
+    # ⚠️ 2026-10-12 取证结论：不要发 "Connection: close"，也不要 60s 高频连击。
+    # smzdm 对机房 IP 的高频抓取会喂"冻结的旧缓存页"——页面结构完好、解析不报
+    # 错，只是永远没有新爆料（静默坑，监控连跑两天 0 新爆料）。实测低频 + 普通
+    # keep-alive 请求即可拿到实时页（诊断 run 38265342850：requests 单发就能
+    # 看到最新爆料）。轮询间隔因此从 60s 提到 300s。
     last = None
     for i in range(RETRY):
         try:
