@@ -1,0 +1,25 @@
+name: 抓取诊断（一次性）
+
+# 用途：验证机房 IP 三种抓法谁能看到最新爆料（183863145 特仑苏）
+# 结论出来后本文件可删
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install requests curl_cffi
+
+      - name: 三种抓取对比
+        run: python probe_fetch.py
