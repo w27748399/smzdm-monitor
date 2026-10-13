@@ -22,6 +22,23 @@ DURATION="${1:-9000}"
 INTERVAL="${POLL_INTERVAL:-60}"
 PY="${PYTHON:-python3}"
 
+# ----------------------------------------------------------------------------
+# 夜间停机窗口（北京时间）：默认 23:00 ~ 次日 08:00 不监控。
+#   - 每轮开始前检查，命中窗口就优雅退出接力（job 提前收工，不硬睡占机时）
+#   - 与 monitor.yml 的 cron 白天点火窗口（0-14 UTC = 北京 8:00-22:30）双保险
+#   - 临时强制监控：ALLOW_NIGHT=1 bash loop.sh
+# ----------------------------------------------------------------------------
+NIGHT_START="${NIGHT_START:-23}" # 北京时间 >= 该小时 -> 停
+NIGHT_END="${NIGHT_END:-8}"      # 北京时间 <  该小时 -> 不起
+ALLOW_NIGHT="${ALLOW_NIGHT:-0}"
+
+is_night() {
+    [ "$ALLOW_NIGHT" = "1" ] && return 1
+    local h
+    h=$(TZ='Asia/Shanghai' date +%H)
+    [ "$h" -ge "$NIGHT_START" ] || [ "$h" -lt "$NIGHT_END" ]
+}
+
 # 只有在真正的 git 仓库里才做状态回写（本机测试时自动跳过）
 IN_GIT=0
 if git rev-parse --git-dir >/dev/null 2>&1; then
@@ -69,6 +86,17 @@ echo "起跑时间：$(date '+%F %T %Z')"
 echo "=================================================================="
 
 while :; do
+    # 夜间停机：命中窗口就收工退出（下一次白天 cron 点火自然接上）
+    if is_night; then
+        echo ""
+        echo "=================================================================="
+        echo "🌙 夜间停机：北京时间 $(TZ='Asia/Shanghai' date '+%F %T')，"
+        echo "   停机窗口 ${NIGHT_START}:00 ~ 次日 ${NIGHT_END}:00（北京时间）不监控。"
+        echo "   本接力共完成 $ROUND 轮，提前收工。"
+        echo "=================================================================="
+        break
+    fi
+
     NOW=$(date +%s)
     [ "$NOW" -ge "$END" ] && break
 
@@ -90,8 +118,13 @@ while :; do
 done
 
 echo "=================================================================="
-echo "接力区间结束（共 $ROUND 轮），收尾再抓一次"
-"$PY" monitor.py --once >/dev/null 2>&1 || true
-commit_state
-echo "退出时间：$(date '+%F %T %Z')"
+# 收尾补抓只在白天做；夜间退出就不补（不违反停机窗口）
+if is_night; then
+    echo "接力区间结束（共 $ROUND 轮），夜间停机不补抓"
+else
+    echo "接力区间结束（共 $ROUND 轮），收尾再抓一次"
+    "$PY" monitor.py --once >/dev/null 2>&1 || true
+    commit_state
+fi
+echo "退出时间：$(TZ='Asia/Shanghai' date '+%F %T') 北京时间 / $(date '+%F %T %Z')"
 echo "=================================================================="
