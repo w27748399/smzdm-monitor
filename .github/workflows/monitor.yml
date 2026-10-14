@@ -86,6 +86,8 @@ jobs:
           RELAY_PAT: ${{ secrets.RELAY_PAT }}
           # 天津限行提醒的额外同步收件人（Secrets 里存邮箱，避免公开仓库暴露）
           LIMIT_EMAIL_TO: ${{ secrets.LIMIT_EMAIL_TO }}
+          # pushplus 横幅推送（限行提醒同步发微信/App；空 = 只发邮件）
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         # 8400s = 2h20m：比 cron 的 2h 间隔多出 20 分钟重叠。
         # 之前跑 5h（18000s）实测会被 GitHub 提前回收 runner（shutdown signal，
         # run 标 failure），白白浪费 3 小时接力；缩到 2h20m 后：
