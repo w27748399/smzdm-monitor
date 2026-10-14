@@ -82,8 +82,6 @@ _DEFAULTS = {
     # --- 天津尾号限行提醒（附加功能，随监控链每轮顺带检查）---
     "LIMIT_TAIL": "1",                      # 关注的尾号
     "LIMIT_EMAIL_TO": "",                   # 限行提醒额外同步的收件邮箱
-    # --- pushplus 横幅推送（附加通道，与主推送通道并行）---
-    "PUSHPLUS_TOKEN": "",                   # pushplus.plus 的 token，空 = 不启用
 }
 
 
@@ -495,24 +493,10 @@ def _send_limit_email(now_bj, pair, label):
         return False
 
 
-def _send_pushplus(title, html):
-    """pushplus 横幅推送（微信/App）。PUSHPLUS_TOKEN 为空时静默跳过。
-    文档：https://www.pushplus.plus/send  POST {token, title, content, template}"""
-    token = (CFG.get("PUSHPLUS_TOKEN") or "").strip()
-    if not token:
-        return False
-    ok = _post("https://www.pushplus.plus/send",
-               {"token": token, "title": title[:100],
-                "content": html, "template": "html"}, "pushplus")
-    if ok:
-        log.info("限行提醒[pushplus] 已推送")
-    else:
-        log.warning("限行提醒[pushplus] 推送失败（额度/网络/token）")
-    return ok
-
-
 def limit_reminder_tick(now_bj=None):
-    """每个轮次调用。限行日 7-19 时每小时一封；当天迟到的首跑也会补发一条。"""
+    """每个轮次调用。限行日 7-19 时每小时一封；当天迟到的首跑也会补发一条。
+    横幅提醒走 QQ 邮箱 App 通知 / 微信"QQ邮箱提醒"公众号（邮件通道自带，免费无限量）；
+    pushplus 实名收费已淘汰（2026-10-14）。"""
     now_bj = now_bj or datetime.now(CST)
     d, h = now_bj.date(), now_bj.hour
     pair = _limit_pair(d)
@@ -533,16 +517,11 @@ def limit_reminder_tick(now_bj=None):
     else:
         label = "出行前预告 %02d:%02d" % (h, now_bj.minute)
     emailed = _send_limit_email(now_bj, pair, label)
-    wd = "一二三四五六日"[now_bj.weekday()]
-    pushed = _send_pushplus(
-        "🚗 今日限行尾号%s（周%s）" % (pair.replace("/", "、"), wd),
-        "<h3>🚗 今日限行尾号 %s（周%s）</h3><p>%s</p>"
-        "<p>⏰ 7:00–19:00 · 📍 外环线(不含)以内</p>"
-        "<p style=\"color:#999\">%s</p>" % (pair.replace("/", " 和 "), wd, label, now_str()))
-    if emailed or pushed:
+    if emailed:
+        wd = "一二三四五六日"[now_bj.weekday()]
         _limit_state_save(key)
-        log.info("限行提醒已记录（%s，尾号%s 限行，email=%s pushplus=%s）",
-                 key, LIMIT_TAIL, emailed, pushed)
+        log.info("限行提醒已记录（%s，尾号%s 限行，email=OK 周%s）",
+                 key, LIMIT_TAIL, wd)
 
 
 # ────────────────────── 健康检查 HTTP 服务 ──────────────────────
@@ -653,11 +632,6 @@ def main():
         pair = _limit_pair(now_bj.date()) or "5/0"
         ok = _send_limit_email(now_bj, pair, "测试邮件（模拟尾号%s限行日）" % LIMIT_TAIL)
         log.info("限行提醒测试邮件：%s", "已发送" if ok else "失败")
-        ok2 = _send_pushplus("🚗 测试：限行提醒已接通 pushplus",
-                             "<h3>🚗 pushplus 通道测试</h3>"
-                             "<p>模拟尾号%s限行日：%s</p><p>收到这条说明横幅推送已打通 ✅</p>"
-                             % (LIMIT_TAIL, now_str()))
-        log.info("限行提醒测试 pushplus：%s", "已推送" if ok2 else "未推送（未配置 token 或失败）")
         return
 
     seen, initialized = load_state()
