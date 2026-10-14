@@ -80,7 +80,7 @@ _DEFAULTS = {
     "SMTP_PORT": "",                        # 留空则自动（SSL 465 / STARTTLS 587）
     "SMTP_SSL": "",                         # 留空自动；"0" 强制 STARTTLS，"1" 强制 SSL
     # --- 天津尾号限行提醒（附加功能，随监控链每轮顺带检查）---
-    "LIMIT_TAIL": "0",                      # 关注的尾号
+    "LIMIT_TAIL": "1",                      # 关注的尾号
     "LIMIT_EMAIL_TO": "",                   # 限行提醒额外同步的收件邮箱
 }
 
@@ -362,13 +362,13 @@ def _send_email(item):
         return False
 
 
-# ────────────── 天津尾号限行提醒（尾号0 · 限行日 7-19 时整点）──────────────
+# ────────────── 天津尾号限行提醒（尾号1 · 限行日 7-19 时整点）──────────────
 # 规则数据源：知识库单一数据源 tianjin_restriction_data.py（G:\DSH\tianjin_car_restriction\）
 # 锚点算法：2026-06-29（周一）限行 1/6，每 13 周（91 天）周一组递减 1 位（mod 5）。
 # 已与天津公安局通告 4 期官方表逐期核对通过；权威期表见通告
 # （2026-03-30 ~ 2027-03-28，工作日 7-19 时，外环线(不含)以内）。
 # ⚠️ 2027 节假日官方安排公布后，需同步更新 _LIMIT_HOLIDAYS（与单一数据源同步改）。
-LIMIT_TAIL = (CFG.get("LIMIT_TAIL") or "0").strip()
+LIMIT_TAIL = (CFG.get("LIMIT_TAIL") or "1").strip()
 LIMIT_EMAIL_TO = (CFG.get("LIMIT_EMAIL_TO") or "").strip()
 LIMIT_STATE_PATH = os.path.join(BASE_DIR, "limit_state.json")
 
@@ -498,8 +498,8 @@ def limit_reminder_tick(now_bj=None):
     now_bj = now_bj or datetime.now(CST)
     d, h = now_bj.date(), now_bj.hour
     pair = _limit_pair(d)
-    if not pair or LIMIT_TAIL not in pair.split("/")[1]:
-        return                                  # 今天不限目标尾号
+    if not pair or LIMIT_TAIL not in pair.replace("/", ""):
+        return                                  # 今天不限目标尾号（两位都查，'1/6' 含尾号1）
 
     last = _limit_state_load()
     today = d.isoformat()
@@ -625,7 +625,7 @@ def main():
     if "--test-limit" in args:
         now_bj = datetime.now(CST)
         pair = _limit_pair(now_bj.date()) or "5/0"
-        ok = _send_limit_email(now_bj, pair, "测试邮件（模拟尾号0限行日）")
+        ok = _send_limit_email(now_bj, pair, "测试邮件（模拟尾号%s限行日）" % LIMIT_TAIL)
         log.info("限行提醒测试邮件：%s", "已发送" if ok else "失败")
         return
 
