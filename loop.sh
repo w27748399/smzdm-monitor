@@ -29,7 +29,7 @@ PY="${PYTHON:-python3}"
 #   - 临时强制监控：ALLOW_NIGHT=1 bash loop.sh
 # ----------------------------------------------------------------------------
 NIGHT_START="${NIGHT_START:-23}" # 北京时间 >= 该小时 -> 停
-NIGHT_END="${NIGHT_END:-8}"      # 北京时间 <  该小时 -> 不起
+NIGHT_END="${NIGHT_END:-7}"      # 北京时间 <  该小时 -> 不起（7点起：天津限行提醒首封 7 点要发）
 ALLOW_NIGHT="${ALLOW_NIGHT:-0}"
 
 is_night() {
@@ -56,9 +56,10 @@ commit_state() {
     # 注意：这里必须用 status --porcelain 而不是 diff --quiet。
     # state.json 首次生成时是"未跟踪文件"，git diff 对它返回空差异，
     # 会导致首轮状态永远回写不上去（实测踩过这个坑）。
-    [ -n "$(git status --porcelain -- state.json 2>/dev/null)" ] || return 0
+    # limit_state.json：天津限行提醒的"本小时已发"去重状态，一并回写。
+    [ -n "$(git status --porcelain -- state.json limit_state.json 2>/dev/null)" ] || return 0
 
-    git add state.json
+    git add state.json limit_state.json
     git -c user.name="$BOT_NAME" -c user.email="$BOT_MAIL" \
         commit -q -m "chore(state): 更新去重状态 $(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
         || return 0

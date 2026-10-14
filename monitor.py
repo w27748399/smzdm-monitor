@@ -35,7 +35,7 @@ import threading
 from email.mime.text import MIMEText
 from email.header import Header
 from email.utils import formataddr
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, date, timezone, timedelta
 
 try:
     import requests
@@ -79,6 +79,9 @@ _DEFAULTS = {
     "SMTP_HOST": "",                        # 留空则按邮箱域名自动推断
     "SMTP_PORT": "",                        # 留空则自动（SSL 465 / STARTTLS 587）
     "SMTP_SSL": "",                         # 留空自动；"0" 强制 STARTTLS，"1" 强制 SSL
+    # --- 天津尾号限行提醒（附加功能，随监控链每轮顺带检查）---
+    "LIMIT_TAIL": "0",                      # 关注的尾号
+    "LIMIT_EMAIL_TO": "",                   # 限行提醒额外同步的收件邮箱
 }
 
 
@@ -359,6 +362,163 @@ def _send_email(item):
         return False
 
 
+# ────────────── 天津尾号限行提醒（尾号0 · 限行日 7-19 时整点）──────────────
+# 规则数据源：知识库单一数据源 tianjin_restriction_data.py（G:\DSH\tianjin_car_restriction\）
+# 锚点算法：2026-06-29（周一）限行 1/6，每 13 周（91 天）周一组递减 1 位（mod 5）。
+# 已与天津公安局通告 4 期官方表逐期核对通过；权威期表见通告
+# （2026-03-30 ~ 2027-03-28，工作日 7-19 时，外环线(不含)以内）。
+# ⚠️ 2027 节假日官方安排公布后，需同步更新 _LIMIT_HOLIDAYS（与单一数据源同步改）。
+LIMIT_TAIL = (CFG.get("LIMIT_TAIL") or "0").strip()
+LIMIT_EMAIL_TO = (CFG.get("LIMIT_EMAIL_TO") or "").strip()
+LIMIT_STATE_PATH = os.path.join(BASE_DIR, "limit_state.json")
+
+_LIMIT_ANCHOR = date(2026, 6, 29)   # 组0 周一 = 1/6
+_LIMIT_CYCLE = 91                   # 13 周一周期
+_LIMIT_PAIRS = ["1/6", "2/7", "3/8", "4/9", "5/0"]   # 组 g 的周一排序
+_LIMIT_HOLIDAYS = [                  # 放假区间内不限行（天津调休补班周末也不限）
+    (date(2026, 1, 1),  date(2026, 1, 3)),   # 元旦
+    (date(2026, 2, 15), date(2026, 2, 23)),  # 春节
+    (date(2026, 4, 4),  date(2026, 4, 6)),   # 清明
+    (date(2026, 5, 1),  date(2026, 5, 5)),   # 劳动节
+    (date(2026, 6, 19), date(2026, 6, 21)),  # 端午
+    (date(2026, 9, 25), date(2026, 9, 27)),  # 中秋
+    (date(2026, 10, 1), date(2026, 10, 7)),  # 国庆
+    (date(2027, 1, 1),  date(2027, 1, 1)),   # 2027 元旦（框架保证 1 天，其余待官方公布）
+]
+
+
+def _limit_pair(d):
+    """返回 d 当天限行的尾号串（如 '5/0'）；不限行返回 None。"""
+    if d.weekday() >= 5:                        # 周六日（含调休补班）天津不限尾号
+        return None
+    for a, b in _LIMIT_HOLIDAYS:
+        if a <= d <= b:
+            return None
+    n = (d - _LIMIT_ANCHOR).days // _LIMIT_CYCLE
+    g = (-n) % 5
+    return _LIMIT_PAIRS[(g + d.weekday()) % 5]
+
+
+def _limit_period_rows(d):
+    """返回当期（d 所在 13 周期）周一~周五的限行尾号行，供邮件表格用。"""
+    n = (d - _LIMIT_ANCHOR).days // _LIMIT_CYCLE
+    g = (-n) % 5
+    return [(["一", "二", "三", "四", "五"][i], _LIMIT_PAIRS[(g + i) % 5])
+            for i in range(5)]
+
+
+def _limit_state_load():
+    try:
+        with open(LIMIT_STATE_PATH, "r", encoding="utf-8") as f:
+            return (json.load(f) or {}).get("last", "")
+    except Exception:
+        return ""
+
+
+def _limit_state_save(v):
+    tmp = LIMIT_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"last": v, "updated": now_str()}, f, ensure_ascii=False)
+    os.replace(tmp, LIMIT_STATE_PATH)
+
+
+def _smtp_endpoint():
+    """SMTP 服务器的 (host, port, use_ssl)。"""
+    if CFG["SMTP_HOST"]:
+        return (CFG["SMTP_HOST"].strip(), int(CFG["SMTP_PORT"] or 465),
+                CFG["SMTP_SSL"] != "0")
+    domain = (CFG["EMAIL_USER"] or "").split("@")[-1].lower()
+    return _SMTP_TABLE.get(domain, ("", 465, True))
+
+
+def _send_limit_email(now_bj, pair, label):
+    """发限行提醒邮件：收件人 = EMAIL_TO + LIMIT_EMAIL_TO。"""
+    user = (CFG["EMAIL_USER"] or "").strip()
+    password = (CFG["EMAIL_PASS"] or "").strip()
+    if not user or not password:
+        log.warning("限行提醒失败：EMAIL_USER / EMAIL_PASS 未配置")
+        return False
+    to_list = [x.strip() for x in
+               ((CFG["EMAIL_TO"] or "") + "," + LIMIT_EMAIL_TO).split(",")
+               if x.strip()] or [user]
+    host, port, use_ssl = _smtp_endpoint()
+    if not host:
+        log.warning("限行提醒失败：无法确定 SMTP 服务器")
+        return False
+
+    wd = "一二三四五六日"[now_bj.weekday()]
+    tails = pair.split("/")
+    subject = "🚗 今日限行尾号%s（周%s）· %s" % (
+        "/".join(tails), wd, label)
+    rows = _limit_period_rows(now_bj.date())
+    tr = "".join(
+        '<tr style="background:%s"><td style="padding:4px 14px">周%s</td>'
+        '<td style="padding:4px 14px;font-weight:%s">%s</td></tr>'
+        % ("#fdecea" if t == pair else "transparent", w,
+           "700;color:#c0392b" if t == pair else "400", t.replace("/", " 和 "))
+        for w, t in rows)
+    n = (now_bj.date() - _LIMIT_ANCHOR).days // _LIMIT_CYCLE
+    next_rotate = _LIMIT_ANCHOR + timedelta(days=(n + 1) * _LIMIT_CYCLE)
+    body_html = (
+        '<div style="font-family:sans-serif;max-width:560px">'
+        '<h2 style="margin:0 0 6px;color:#c0392b">🚗 今日限行尾号 %s（周%s）</h2>'
+        '<p style="margin:4px 0">%s · <b>%s</b></p>'
+        '<table style="border-collapse:collapse;margin:10px 0">%s</table>'
+        '<p style="margin:4px 0">⏰ 限行时间：<b>7:00 – 19:00</b>　📍 范围：外环线(不含)以内</p>'
+        '<p style="margin:4px 0">尾号为英文字母的按 0 号管理；周末及法定节假日不限行。</p>'
+        '<p style="margin:10px 0 4px;color:#e67e22">⚠️ %s 起尾号轮换，届时提醒自动跟随新表。</p>'
+        '<p style="color:#999;font-size:12px">%s · 天津尾号限行提醒（GitHub Actions）</p></div>'
+    ) % ("/".join(tails), wd, now_bj.strftime("%Y-%m-%d"), label,
+         tr, next_rotate.isoformat(), now_str())
+
+    msg = MIMEText(body_html, "html", "utf-8")
+    msg["Subject"] = Header(subject, "utf-8")
+    msg["From"] = formataddr((Header("天津限行提醒", "utf-8").encode(), user))
+    msg["To"] = ", ".join(to_list)
+    try:
+        if use_ssl:
+            s = smtplib.SMTP_SSL(host, port, timeout=TIMEOUT)
+        else:
+            s = smtplib.SMTP(host, port, timeout=TIMEOUT)
+            s.starttls()
+        try:
+            s.login(user, password)
+            s.sendmail(user, to_list, msg.as_string())
+        finally:
+            s.quit()
+        log.info("限行提醒[email] 已发送 -> %s", ", ".join(to_list))
+        return True
+    except Exception as e:
+        log.warning("限行提醒失败[email]：%s", e)
+        return False
+
+
+def limit_reminder_tick(now_bj=None):
+    """每个轮次调用。限行日 7-19 时每小时一封；当天迟到的首跑也会补发一条。"""
+    now_bj = now_bj or datetime.now(CST)
+    d, h = now_bj.date(), now_bj.hour
+    pair = _limit_pair(d)
+    if not pair or LIMIT_TAIL not in pair.split("/")[1]:
+        return                                  # 今天不限目标尾号
+
+    last = _limit_state_load()
+    today = d.isoformat()
+    key = "%s-%02d" % (today, h)
+    if last == key:
+        return                                  # 本小时已发
+    in_window = 7 <= h <= 19
+    if not in_window and (last[:10] == today or h > 19):
+        return                                  # 时段外：今天已发过 / 已过 19 点不补
+
+    if in_window:
+        label = "第%d次提醒 %02d:00" % (h - 6, h)
+    else:
+        label = "出行前预告 %02d:%02d" % (h, now_bj.minute)
+    if _send_limit_email(now_bj, pair, label):
+        _limit_state_save(key)
+        log.info("限行提醒已记录（%s，尾号%s 限行）", key, LIMIT_TAIL)
+
+
 # ────────────────────── 健康检查 HTTP 服务 ──────────────────────
 _HEALTH = {"last_ok": None, "last_items": 0, "rounds": 0, "err": ""}
 
@@ -462,6 +622,13 @@ def main():
         log.info("测试推送结果：%s", "成功" if ok else "失败")
         return
 
+    if "--test-limit" in args:
+        now_bj = datetime.now(CST)
+        pair = _limit_pair(now_bj.date()) or "5/0"
+        ok = _send_limit_email(now_bj, pair, "测试邮件（模拟尾号0限行日）")
+        log.info("限行提醒测试邮件：%s", "已发送" if ok else "失败")
+        return
+
     seen, initialized = load_state()
     if seen:
         log.info("已加载历史状态：%d 条 ID", len(seen))
@@ -476,6 +643,7 @@ def main():
         seen, initialized = one_round(seen, initialized, do_push=not no_push)
         if save_state(seen, initialized):
             log.info("状态已更新（%d 条记录）。", len(seen[-MAX_STATE:]))
+        limit_reminder_tick()
         log.info("单轮完成。")
         return
 
@@ -486,6 +654,7 @@ def main():
             seen, initialized = one_round(seen, initialized, do_push=not no_push)
             if save_state(seen, initialized):
                 log.info("状态已更新（%d 条记录）。", len(seen[-MAX_STATE:]))
+            limit_reminder_tick()
             _HEALTH["rounds"] += 1
         except KeyboardInterrupt:
             log.info("已停止。")

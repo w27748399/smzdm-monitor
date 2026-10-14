@@ -20,10 +20,11 @@ on:
     # 压到 ~30min 量级。concurrency 组保证同时只有一个接力在跑，多余点火
     # 在队列里排队/被 GitHub 以"只保留最新 pending"合并，无副作用。
     #
-    # 夜间停机（2026-10-13）：小时位限定 0-14 UTC = 北京时间 08:00~22:30
-    # 才点火，夜里（北京 22:30~次日 08:00）不再有新点火；正在跑的接力
-    # 到北京时间 23:00 也会被 loop.sh 的夜间护栏优雅叫停，双保险。
-    - cron: '*/30 0-14 * * *'
+    # 夜间停机（2026-10-13）：小时位 23,0-14 UTC = 北京 07:00~22:30 才点火
+    # （23 UTC = 次日北京 7:00 —— 天津限行提醒首封 7 点要发，早班提前）。
+    # 夜里（北京 23:00~次日 07:00）不再有新点火；正在跑的接力到北京 23:00
+    # 也会被 loop.sh 的夜间护栏优雅叫停，双保险。
+    - cron: '*/30 23,0-14 * * *'
   workflow_dispatch: # 支持在 Actions 页面手动点一下立刻启动
 
 concurrency:
@@ -83,6 +84,8 @@ jobs:
           # 接力棒自续：loop.sh 收工时用它调 dispatch API 点下一棒，
           # 绕开 GitHub schedule 高峰期静默丢弃点火的问题（cron 只做兜底）
           RELAY_PAT: ${{ secrets.RELAY_PAT }}
+          # 天津限行提醒的额外同步收件人（Secrets 里存邮箱，避免公开仓库暴露）
+          LIMIT_EMAIL_TO: ${{ secrets.LIMIT_EMAIL_TO }}
         # 8400s = 2h20m：比 cron 的 2h 间隔多出 20 分钟重叠。
         # 之前跑 5h（18000s）实测会被 GitHub 提前回收 runner（shutdown signal，
         # run 标 failure），白白浪费 3 小时接力；缩到 2h20m 后：
