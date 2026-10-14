@@ -75,6 +75,35 @@ commit_state() {
     echo "  ! 状态回写失败（本轮推送不受影响，下一轮会重试）"
 }
 
+# ----------------------------------------------------------------------------
+# 接力棒自续：本棒跑完时用 PAT 调 API 点火下一棒。
+# 为什么：GitHub schedule 高峰期会静默丢弃 cron 点火（官方文档承认
+# "may be delayed or dropped"），实测 10-13 晚间 18:00-23:48 五个多小时
+# 黑窗、10-14 上午 08:00-12:30 又黑 4.5 小时 —— */30 一天 36 发被丢大半。
+# self-dispatch 走 API 不经过那个调度器，点火必达；cron 降级为兜底
+# （仅在本棒被 runner 回收等意外死亡时才用得上）。
+# ----------------------------------------------------------------------------
+dispatch_relay() {
+    [ -n "$RELAY_PAT" ] || { echo "  ! 无 RELAY_PAT，跳过自续（靠 cron 兜底）"; return 0; }
+    local repo="${GITHUB_REPOSITORY:-w27748399/smzdm-monitor}"
+    local i code ok=0
+    for i in 1 2 3; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $RELAY_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$repo/actions/workflows/monitor.yml/dispatches" \
+            -d '{"ref":"main"}') || code=000
+        if [ "$code" = "204" ]; then
+            echo "  → 已亲手点火下一棒接力（self-dispatch 204）"
+            ok=1
+            break
+        fi
+        echo "  ! 续接力尝试 $i 失败（HTTP $code），重试..."
+        sleep 3
+    done
+    [ "$ok" = "1" ] || echo "  ! 自续失败，靠 cron 兜底"
+}
+
 START=$(date +%s)
 END=$((START + DURATION))
 ROUND=0
@@ -121,10 +150,13 @@ echo "=================================================================="
 # 收尾补抓只在白天做；夜间退出就不补（不违反停机窗口）
 if is_night; then
     echo "接力区间结束（共 $ROUND 轮），夜间停机不补抓"
+    echo "🌙 夜间停机，不续接力（明早 ${NIGHT_END}:00 由 cron 恢复）"
 else
     echo "接力区间结束（共 $ROUND 轮），收尾再抓一次"
     "$PY" monitor.py --once >/dev/null 2>&1 || true
     commit_state
+    # 亲手点火下一棒（夜间不点）
+    dispatch_relay
 fi
 echo "退出时间：$(TZ='Asia/Shanghai' date '+%F %T') 北京时间 / $(date '+%F %T %Z')"
 echo "=================================================================="
