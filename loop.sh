@@ -53,13 +53,17 @@ BOT_MAIL="41898282+github-actions[bot]@users.noreply.github.com"
 commit_state() {
     [ "$IN_GIT" = "1" ] || return 0
 
-    # 注意：这里必须用 status --porcelain 而不是 diff --quiet。
-    # state.json 首次生成时是"未跟踪文件"，git diff 对它返回空差异，
-    # 会导致首轮状态永远回写不上去（实测踩过这个坑）。
-    # limit_state.json：天津限行提醒的"本小时已发"去重状态，一并回写。
-    [ -n "$(git status --porcelain -- state.json limit_state.json 2>/dev/null)" ] || return 0
+    # ⚠️ 2026-10-15 踩坑修复：pathspec 不能写死 limit_state.json。
+    # 它只有限行日整点提醒发出后才会生成；非限行日 runner 上根本不存在，
+    # git status 对不存在的 pathspec 直接 fatal（stdout 为空）→ 本函数误判
+    # "无变化"提前 return → state.json 永不回写 → 每根新棒 checkout 到旧
+    # 状态，把已发过的爆料当新条目重发（10-15 上午线报连发两遍的根因）。
+    local files="state.json"
+    [ -f limit_state.json ] && files="state.json limit_state.json"
 
-    git add state.json limit_state.json
+    [ -n "$(git status --porcelain -- $files 2>/dev/null)" ] || return 0
+
+    git add $files
     git -c user.name="$BOT_NAME" -c user.email="$BOT_MAIL" \
         commit -q -m "chore(state): 更新去重状态 $(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
         || return 0
