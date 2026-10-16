@@ -21,16 +21,20 @@ jobs:
       - name: Do checkin
         id: checkin
         env:
+          # 多账号：JSON 数组，脚本内部逐账号签到
+          WB_CHECKIN_ACCOUNTS: ${{ secrets.WB_CHECKIN_ACCOUNTS }}
+          # 回退（旧单账号配置，WB_CHECKIN_ACCOUNTS 缺失时生效）
           WB_CHECKIN_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
           WB_CHECKIN_UID: ${{ secrets.WB_CHECKIN_UID }}
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
         run: python3 wb_checkin.py
 
       - name: Build credits report
-        # 逐日积分快照 + 7 天到期提醒；无论签到成功与否都抓（token 失效时抓不到也不影响结论）
+        # 逐账号积分快照 + 7 天到期提醒；无论签到成功与否都抓（token 失效时抓不到也不影响结论）
         if: always()
         continue-on-error: true
         env:
+          WB_CHECKIN_ACCOUNTS: ${{ secrets.WB_CHECKIN_ACCOUNTS }}
           WB_CHECKIN_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
           WB_CHECKIN_UID: ${{ secrets.WB_CHECKIN_UID }}
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
@@ -42,7 +46,6 @@ jobs:
         env:
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           SMTP_SSL: ${{ secrets.SMTP_SSL }}
@@ -50,33 +53,38 @@ jobs:
           GH_EVENT: ${{ github.event_name }}
           GH_CRON_OK: ${{ job.status }}
         run: |
-          import os, smtplib, ssl, datetime
+          import os, smtplib, ssl, datetime, json
           from email.mime.text import MIMEText
           from email.header import Header
-          user = os.environ["EMAIL_USER"]; pwd = os.environ["EMAIL_PASS"]; to = os.environ["EMAIL_TO"]
+          user = os.environ["EMAIL_USER"]; pwd = os.environ["EMAIL_PASS"]
+          # 收件人固定为单一邮箱（按需求：只发 734352499@qq.com）
+          to = "734352499@qq.com"
           host = (os.environ.get("SMTP_HOST") or "").strip() or "smtp.qq.com"
           port_s = (os.environ.get("SMTP_PORT") or "").strip()
           port = int(port_s) if port_s.isdigit() else 465
           use_ssl = (os.environ.get("SMTP_SSL") or "true").strip().lower() in ("1", "true", "yes")
           now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-          # 读签到结果文件（签到 step 未跑到时兜底）
-          title, status, detail = "⚠️ 未执行到签到步骤", "skipped", "workflow 在签到 step 之前就中断了（checkout/环境问题），请查看运行日志。"
+          # 读签到结果（JSON，多账号；签到 step 未跑到时兜底）
+          overall, otitle, accounts = "failed", "⚠️ 未执行到签到步骤", []
           try:
-            with open("checkin_result.txt", encoding="utf-8") as f:
-              for line in f:
-                if line.startswith("status="): status = line.split("=",1)[1].strip()
-                elif line.startswith("title="): title = line.split("=",1)[1].strip()
-                elif line.startswith("detail="): detail = line.split("=",1)[1].strip()
+            with open("checkin_result.json", encoding="utf-8") as f:
+              d = json.load(f)
+              overall = d.get("overall") or "?"
+              otitle = d.get("title") or "?"
+              accounts = d.get("accounts") or []
           except FileNotFoundError:
-            pass
-          # 读积分快照 + 快到期提醒块（--credits step 产出）
+            accounts = [{"name": "?", "status": "failed", "title": "⚠️ 未执行到签到步骤",
+                         "detail": "workflow 在签到 step 之前就中断了（checkout/环境问题），请查看运行日志。"}]
+          except Exception as e:
+            accounts = [{"name": "?", "status": "failed", "title": "⚠️ 结果解析失败", "detail": str(e)}]
+          # 读积分快照 + 快到期提醒块（--credits step 产出，已按账号分段）
           credits_block = ""
           try:
             with open("credits_block.txt", encoding="utf-8") as f:
               credits_block = f.read().strip()
           except FileNotFoundError:
             pass
-          # 到期标记：主题行加警示
+          # 到期标记：主题行加警示（各账号合计）
           expire_mark = ""
           try:
             with open("credits_expire_flag.txt", encoding="utf-8") as f:
@@ -86,16 +94,19 @@ jobs:
           except Exception:
             pass
           run_url = os.environ.get("GH_RUN_URL", "")
-          body = "WorkBuddy 每日签到结果\n" + "=" * 32 + "\n" \
+          body = "WorkBuddy 每日签到结果（%d 个账号）\n" % len(accounts) + "=" * 36 + "\n" \
                  "时间: " + now + " (北京时间)\n" \
-                 "结果: " + title + "\n" \
-                 "详情: " + detail + "\n"
+                 "整体: " + otitle + "\n\n"
+          for a in accounts:
+            body += "· %s：%s\n" % (a.get("name", "?"), a.get("title", "?"))
+            if a.get("status") in ("expired", "failed"):
+              body += "    详情: %s\n" % str(a.get("detail", "")).replace("\n", " / ")
           if credits_block:
-            body += "\n" + "-" * 32 + "\n" + credits_block + "\n"
+            body += "\n" + "-" * 36 + "\n" + credits_block + "\n"
           body += "\n触发: " + os.environ.get("GH_EVENT", "?") + "\n" \
                   "运行日志: " + run_url + "\n"
           msg = MIMEText(body, "plain", "utf-8")
-          msg["Subject"] = Header("WorkBuddy 签到 " + title + expire_mark + " @ " + now, "utf-8")
+          msg["Subject"] = Header("WorkBuddy 签到 " + otitle + expire_mark + " @ " + now, "utf-8")
           msg["From"] = user
           msg["To"] = to
           if use_ssl:
@@ -105,4 +116,4 @@ jobs:
           s.login(user, pwd)
           s.sendmail(user, [to], msg.as_string())
           s.quit()
-          print("daily result email sent:", title, expire_mark, "->", to)
+          print("daily result email sent:", otitle, expire_mark, "->", to)
