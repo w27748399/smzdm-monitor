@@ -26,6 +26,16 @@ jobs:
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
         run: python3 wb_checkin.py
 
+      - name: Build credits report
+        # 逐日积分快照 + 7 天到期提醒；无论签到成功与否都抓（token 失效时抓不到也不影响结论）
+        if: always()
+        continue-on-error: true
+        env:
+          WB_CHECKIN_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
+          WB_CHECKIN_UID: ${{ secrets.WB_CHECKIN_UID }}
+          GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
+        run: python3 wb_checkin.py --credits
+
       - name: Email daily result
         if: always()
         shell: python
@@ -59,15 +69,33 @@ jobs:
                 elif line.startswith("detail="): detail = line.split("=",1)[1].strip()
           except FileNotFoundError:
             pass
+          # 读积分快照 + 快到期提醒块（--credits step 产出）
+          credits_block = ""
+          try:
+            with open("credits_block.txt", encoding="utf-8") as f:
+              credits_block = f.read().strip()
+          except FileNotFoundError:
+            pass
+          # 到期标记：主题行加警示
+          expire_mark = ""
+          try:
+            with open("credits_expire_flag.txt", encoding="utf-8") as f:
+              flag, total = f.read().strip().split("|", 1)
+              if flag == "1" and float(total) > 0:
+                expire_mark = " ⚠️%s分将到期" % total
+          except Exception:
+            pass
           run_url = os.environ.get("GH_RUN_URL", "")
           body = "WorkBuddy 每日签到结果\n" + "=" * 32 + "\n" \
                  "时间: " + now + " (北京时间)\n" \
                  "结果: " + title + "\n" \
-                 "详情: " + detail + "\n" \
-                 "触发: " + os.environ.get("GH_EVENT", "?") + "\n" \
-                 "运行日志: " + run_url + "\n"
+                 "详情: " + detail + "\n"
+          if credits_block:
+            body += "\n" + "-" * 32 + "\n" + credits_block + "\n"
+          body += "\n触发: " + os.environ.get("GH_EVENT", "?") + "\n" \
+                  "运行日志: " + run_url + "\n"
           msg = MIMEText(body, "plain", "utf-8")
-          msg["Subject"] = Header("WorkBuddy 签到 " + title + " @ " + now, "utf-8")
+          msg["Subject"] = Header("WorkBuddy 签到 " + title + expire_mark + " @ " + now, "utf-8")
           msg["From"] = user
           msg["To"] = to
           if use_ssl:
@@ -77,4 +105,4 @@ jobs:
           s.login(user, pwd)
           s.sendmail(user, [to], msg.as_string())
           s.quit()
-          print("daily result email sent:", title, "->", to)
+          print("daily result email sent:", title, expire_mark, "->", to)
