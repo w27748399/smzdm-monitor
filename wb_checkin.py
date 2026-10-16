@@ -2,20 +2,31 @@
 """
 WorkBuddy 云端签到 + 积分快照 + 快到期提醒（GitHub Actions 版，零第三方依赖）
 ==========================================================================
+支持 **多账号**。
+
 用法:
-  python3 wb_checkin.py             # 签到（原行为不变）
+  python3 wb_checkin.py             # 签到（对配置里的每个账号各签一次，幂等）
   python3 wb_checkin.py --credits   # 只抓积分+快到期，写 credits_block.txt（供邮件 step 读）
 
-env:
-  WB_CHECKIN_TOKEN  当前号 accessToken（Secrets）
-  WB_CHECKIN_UID    当前号 uid（Secrets）
+env（推荐，多账号）:
+  WB_CHECKIN_ACCOUNTS   JSON 数组:
+      [{"name":"例外.","token":"<accessToken>","uid":"<uid>"}, {"name":"破例.","token":"...","uid":"..."}]
+      （也接受 {"accounts":[...]} 包裹形式）
+
+env（回退，单账号，向后兼容旧配置）:
+  WB_CHECKIN_TOKEN / WB_CHECKIN_UID / WB_CHECKIN_NAME(可选)
 
 退出码:
-  0   签到成功 / 已签到 / 活动未开放（不算失败）
-  2   HTTP 401/403 —— token 过期或无效，触发 workflow 邮件告警
-  1   其他失败
+  0   至少有一个账号签到成功 / 已签到 / 活动未开放（含“部分账号异常”）
+  2   全部账号 token 过期失效（HTTP 401/403）
+  1   全部账号失败（非 token 原因）/ 配置缺失
 
---credits 模式: 抓到积分返回 0，抓不到返回 1（不影响签到 job 结论）
+--credits 模式: 全部账号抓到积分返回 0，否则 1（不影响签到 job 结论）
+
+产物:
+  checkin_result.json   每个账号的签到结果（status/title/detail），供邮件 step 读
+  credits_block.txt     每账号一段的积分快照 + 快到期明细
+  credits_expire_flag.txt  "1|<合计清零分>" 或 "0|0"，供邮件主题警示用
 """
 import os
 import sys
@@ -39,6 +50,49 @@ EXPIRING_WINDOW_DAYS = 7
 
 INACTIVE_RE = re.compile(r"未开启|未开始|未开放|已过期|无.*活动|活动.*(结束|关闭|暂停)", re.I)
 ALREADY_RE = re.compile(r"已签到|已领取|已经.*(签到|领取)|重复签到|already\s*(checked[- ]?in|claimed)|already", re.I)
+
+RESULT_FILE = "checkin_result.json"
+CREDITS_FILE = "credits_block.txt"
+# 供 workflow 邮件 step 读取的到期汇总（供主题行判断）
+EXPIRE_FLAG = "credits_expire_flag.txt"
+
+
+# ------------------------------------------------------------------
+# 账号配置
+# ------------------------------------------------------------------
+
+def load_accounts():
+    """返回 [{"name","token","uid"}]。优先 WB_CHECKIN_ACCOUNTS(JSON)，否则回退单账号 env。"""
+    out = []
+    raw = (os.environ.get("WB_CHECKIN_ACCOUNTS") or "").strip()
+    if raw:
+        try:
+            arr = json.loads(raw)
+            if isinstance(arr, dict):
+                arr = arr.get("accounts") or []
+            for i, a in enumerate(arr or []):
+                if not isinstance(a, dict):
+                    continue
+                t = str(a.get("token") or "").strip()
+                u = str(a.get("uid") or "").strip()
+                if t and u:
+                    out.append({
+                        "name": (str(a.get("name") or ("账号%d" % (i + 1))).strip() or ("账号%d" % (i + 1))),
+                        "token": t,
+                        "uid": u,
+                    })
+        except Exception as e:
+            print("! WB_CHECKIN_ACCOUNTS 解析失败（回退单账号）:", e)
+    if not out:
+        t = (os.environ.get("WB_CHECKIN_TOKEN") or "").strip()
+        u = (os.environ.get("WB_CHECKIN_UID") or "").strip()
+        if t and u:
+            out.append({
+                "name": (os.environ.get("WB_CHECKIN_NAME") or "账号1").strip() or "账号1",
+                "token": t,
+                "uid": u,
+            })
+    return out
 
 
 def token_issuer_origin(token):
@@ -93,20 +147,16 @@ def summary(line):
             f.write(line + "\n")
 
 
-RESULT_FILE = "checkin_result.txt"
-CREDITS_FILE = "credits_block.txt"
-# 供 workflow 邮件 step 读取的到期汇总（供主题行判断）
-EXPIRE_FLAG = "credits_expire_flag.txt"
-
-
-def write_result(status, title, detail):
-    """把签到结果落盘给邮件 step 读（status: ok/already/inactive/expired/failed）"""
+def write_result(overall, title, accounts):
+    """把多账号签到结果落盘（JSON）给邮件 step 读。
+    accounts: [{"name","uid","status","title","detail"}]，status ∈ ok/already/inactive/expired/failed"""
+    data = {"overall": overall, "title": title, "accounts": accounts}
     with open(RESULT_FILE, "w", encoding="utf-8") as f:
-        f.write("status=%s\ntitle=%s\ndetail=%s\n" % (status, title, detail))
+        json.dump(data, f, ensure_ascii=False, indent=2)
     p = os.environ.get("GITHUB_OUTPUT")
     if p:
         with open(p, "a", encoding="utf-8") as f:
-            f.write("status=%s\ntitle=%s\n" % (status, title))
+            f.write("status=%s\ntitle=%s\n" % (overall, title))
 
 
 # ------------------------------------------------------------------
@@ -221,7 +271,7 @@ def expiring_pools(pools, days=EXPIRING_WINDOW_DAYS):
 
 
 def build_credits_block(credits):
-    """把积分快照 + 到期明细拼成多行文本块（供邮件正文 / Step Summary 使用）。"""
+    """把单个账号的积分快照 + 到期明细拼成多行文本块。"""
     if not credits.get("ok"):
         return "【积分快照】\n⚠️ 获取失败：%s\n" % credits.get("err")
     lines = ["【积分快照】"]
@@ -241,44 +291,46 @@ def build_credits_block(credits):
 
 
 def do_credits_report():
-    """--credits 模式：抓积分 → 写 credits_block.txt（+ 到期标记文件），并写 Step Summary。"""
-    token = (os.environ.get("WB_CHECKIN_TOKEN") or "").strip()
-    uid = (os.environ.get("WB_CHECKIN_UID") or "").strip()
-    if not token or not uid:
-        print("❌ 缺少 WB_CHECKIN_TOKEN / WB_CHECKIN_UID，无法抓积分")
+    """--credits 模式：逐账号抓积分 → 拼成多段 credits_block.txt（+ 到期标记），并写 Step Summary。"""
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未配置账号，无法抓积分（缺 WB_CHECKIN_ACCOUNTS 或 WB_CHECKIN_TOKEN/UID）")
         with open(CREDITS_FILE, "w", encoding="utf-8") as f:
-            f.write("【积分快照】\n⚠️ 缺少 Secrets（WB_CHECKIN_TOKEN / WB_CHECKIN_UID）\n")
-        return 1
-    credits = fetch_credits(token, uid)
-    block = build_credits_block(credits)
-    with open(CREDITS_FILE, "w", encoding="utf-8") as f:
-        f.write(block)
-    print(block)
-    summary("### " + block.replace("\n", "\n"))
-    # 到期标记：有到期则写 "1"，否则 "0"（供邮件主题用）
-    try:
-        items, total_clear = expiring_pools(credits["pools"]) if credits.get("ok") else ([], 0)
-        with open(EXPIRE_FLAG, "w", encoding="utf-8") as f:
-            f.write("%s|%s" % ("1" if items else "0", total_clear))
-    except Exception:
+            f.write("【积分快照】\n⚠️ 缺少 Secrets（WB_CHECKIN_ACCOUNTS）\n")
         with open(EXPIRE_FLAG, "w", encoding="utf-8") as f:
             f.write("0|0")
-    return 0 if credits.get("ok") else 1
+        return 1
+
+    all_ok = True
+    all_items = []
+    blocks = []
+    for a in accounts:
+        credits = fetch_credits(a["token"], a["uid"])
+        if not credits.get("ok"):
+            all_ok = False
+        else:
+            items, _total = expiring_pools(credits["pools"])
+            all_items += items
+        blocks.append("【账号 %s】\n%s" % (a["name"], build_credits_block(credits).rstrip()))
+
+    text = "\n\n".join(blocks) + "\n"
+    with open(CREDITS_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+    print(text)
+    summary("### 积分快照（%d 个账号）\n\n%s" % (len(accounts), text))
+    total_clear = round(sum(x["remain"] for x in all_items), 2)
+    with open(EXPIRE_FLAG, "w", encoding="utf-8") as f:
+        f.write("%s|%s" % ("1" if all_items else "0", total_clear))
+    return 0 if all_ok else 1
 
 
 # ------------------------------------------------------------------
 # 签到
 # ------------------------------------------------------------------
 
-def do_checkin():
-    token = (os.environ.get("WB_CHECKIN_TOKEN") or "").strip()
-    uid = (os.environ.get("WB_CHECKIN_UID") or "").strip()
-    if not token or not uid:
-        print("❌ 缺少 WB_CHECKIN_TOKEN / WB_CHECKIN_UID 环境变量")
-        summary("### WorkBuddy 签到 ❌\n\n缺少 Secrets（WB_CHECKIN_TOKEN / WB_CHECKIN_UID）")
-        write_result("failed", "❌ 配置缺失", "缺少 Secrets（WB_CHECKIN_TOKEN / WB_CHECKIN_UID）")
-        return 1
-
+def checkin_one(acct):
+    """对单个账号签到，返回 (status, title, detail)。status ∈ ok/already/inactive/expired/failed"""
+    token, uid = acct["token"], acct["uid"]
     hosts = []
     iss = token_issuer_origin(token)
     if iss:
@@ -317,32 +369,63 @@ def do_checkin():
                 last_line = "%s -> %s" % (url, res.get("message"))
                 print(" ", last_line)
                 if res.get("ok"):
-                    tag = "✅ 签到成功" if not res.get("already") else "☑️ 今日已签到（幂等跳过）"
-                    print(tag)
-                    summary("### WorkBuddy 签到 %s\n\n- 账号 uid: `%s`\n- 接口: `%s`\n- 响应: %s" % (
-                        tag, uid, pth, res.get("message")))
                     if res.get("already"):
-                        write_result("already", "☑️ 今日已签到", "响应：%s\n接口：%s" % (res.get("message"), pth))
-                    else:
-                        write_result("ok", "✅ 签到成功", "响应：%s\n接口：%s" % (res.get("message"), pth))
-                    return 0
+                        print("  ☑️ 今日已签到（幂等跳过）")
+                        return ("already", "☑️ 今日已签到", "响应：%s\n接口：%s" % (res.get("message"), pth))
+                    print("  ✅ 签到成功")
+                    return ("ok", "✅ 签到成功", "响应：%s\n接口：%s" % (res.get("message"), pth))
                 if res.get("inactive"):
-                    print("ℹ️ 签到活动未开放（不算失败）")
-                    summary("### WorkBuddy 签到 ℹ️ 活动未开放\n\n- 响应: %s" % res.get("message"))
-                    write_result("inactive", "ℹ️ 活动未开放", "响应：%s" % res.get("message"))
-                    return 0
+                    print("  ℹ️ 签到活动未开放（不算失败）")
+                    return ("inactive", "ℹ️ 活动未开放", "响应：%s" % res.get("message"))
             else:
                 print("  !", url, "-> 非JSON响应 HTTP", status)
 
     if tried_expired:
-        print("❌ token 已过期或无效 —— 需本地重新提取并更新 Secrets")
-        summary("### WorkBuddy 签到 ❌ token 失效\n\n请本地运行 memscan_sign.py 重新提取 token 并更新仓库 Secrets。")
-        write_result("expired", "❌ token 已失效", "HTTP 401/403，接口拒绝。\n处理：本地运行 memscan_sign.py 重新提取 token 并更新仓库 Secrets。")
+        return ("expired", "❌ token 已失效",
+                "HTTP 401/403，接口拒绝。\n处理：本地重新提取该账号 accessToken 并更新 WB_CHECKIN_ACCOUNTS。")
+    return ("failed", "❌ 全部端点失败", "最后响应：%s" % last_line)
+
+
+def do_checkin():
+    accounts = load_accounts()
+    if not accounts:
+        print("❌ 未配置账号（缺 WB_CHECKIN_ACCOUNTS 或 WB_CHECKIN_TOKEN/UID）")
+        summary("### WorkBuddy 签到 ❌\n\n缺少 Secrets（WB_CHECKIN_ACCOUNTS）")
+        write_result("failed", "❌ 配置缺失",
+                     [{"name": "?", "uid": "", "status": "failed", "title": "❌ 配置缺失",
+                       "detail": "缺少 WB_CHECKIN_ACCOUNTS 或 WB_CHECKIN_TOKEN/UID"}])
+        return 1
+
+    results = []
+    for a in accounts:
+        print("=== 账号 %s (uid %s) ===" % (a["name"], a["uid"][:8]))
+        st, ti, de = checkin_one(a)
+        results.append({"name": a["name"], "uid": a["uid"], "status": st, "title": ti, "detail": de})
+
+    statuses = [r["status"] for r in results]
+    if all(s == "expired" for s in statuses):
+        overall, otitle = "expired", "❌ 全部账号 token 失效"
+    elif all(s in ("expired", "failed") for s in statuses):
+        overall, otitle = "failed", "❌ 全部账号失败"
+    elif any(s in ("expired", "failed") for s in statuses):
+        overall, otitle = "partial", "⚠️ 部分账号异常"
+    elif any(s == "ok" for s in statuses):
+        overall, otitle = "ok", "✅ 全部签到成功"
+    else:
+        overall, otitle = "already", "☑️ 今日已签到"
+
+    write_result(overall, otitle, results)
+    summary("### WorkBuddy 签到 %s\n\n%s" % (
+        otitle, "\n".join("- **%s**：%s" % (r["name"], r["title"]) for r in results)))
+    print("\n" + otitle)
+    for r in results:
+        print("  · %s：%s" % (r["name"], r["title"]))
+
+    if overall == "expired":
         return 2
-    print("❌ 所有签到端点都未成功", last_line)
-    summary("### WorkBuddy 签到 ❌ 全部端点失败\n\n- 最后: %s" % last_line)
-    write_result("failed", "❌ 全部端点失败", "最后响应：%s" % last_line)
-    return 1
+    if overall == "failed":
+        return 1
+    return 0
 
 
 def main():
