@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-WorkBuddy 云端签到 + 积分快照 + 快到期提醒（GitHub Actions 版，零第三方依赖）
+WorkBuddy 云端签到 + 连登打卡 + 积分快照 + 快到期提醒（GitHub Actions 版，零第三方依赖）
 ==========================================================================
 支持 **多账号**。
 
+v3（2026-10-20）：新增「连登打卡」活跃上报。
+  背景：签到（daily-checkin）只领积分；活跃地图连登要求当天**完成一次对话**。
+  本版签到后逐账号做活跃上报（移植自本地 wb_switch.py do_activate，改写为零依赖）：
+    1) GET /activity/growth/heatmap 查今日 is_active，已活跃则跳过（幂等，不耗积分）
+    2) POST /console/as/conversations/ 建最小会话（prompt=你好, model=deepseek-r1）
+    3) ACP SSE 握手 + session/prompt 发送一句 → 当天被记活跃
+  活跃失败不影响签到结论与退出码（与本地 all 命令同口径）。
+
 用法:
-  python3 wb_checkin.py             # 签到（对配置里的每个账号各签一次，幂等）
+  python3 wb_checkin.py             # 签到 + 连登打卡（对配置里每个账号各一次，幂等）
   python3 wb_checkin.py --credits   # 只抓积分+快到期，写 credits_block.txt（供邮件 step 读）
+  WB_CHECKIN_ACTIVITY=0             # 关闭连登打卡（只签到）
 
 env（推荐，多账号）:
   WB_CHECKIN_ACCOUNTS   JSON 数组:
@@ -17,14 +26,14 @@ env（回退，单账号，向后兼容旧配置）:
   WB_CHECKIN_TOKEN / WB_CHECKIN_UID / WB_CHECKIN_NAME(可选)
 
 退出码:
-  0   至少有一个账号签到成功 / 已签到 / 活动未开放（含“部分账号异常”）
+  0   至少有一个账号签到成功 / 已签到 / 活动未开放（含"部分账号异常"）
   2   全部账号 token 过期失效（HTTP 401/403）
   1   全部账号失败（非 token 原因）/ 配置缺失
 
 --credits 模式: 全部账号抓到积分返回 0，否则 1（不影响签到 job 结论）
 
 产物:
-  checkin_result.json   每个账号的签到结果（status/title/detail），供邮件 step 读
+  checkin_result.json   每个账号的签到+连登结果（status/title/detail/activity），供邮件 step 读
   credits_block.txt     每账号一段的积分快照 + 快到期明细
   credits_expire_flag.txt  "1|<合计清零分>" 或 "0|0"，供邮件主题警示用
 """
@@ -55,6 +64,10 @@ RESULT_FILE = "checkin_result.json"
 CREDITS_FILE = "credits_block.txt"
 # 供 workflow 邮件 step 读取的到期汇总（供主题行判断）
 EXPIRE_FLAG = "credits_expire_flag.txt"
+
+# 连登打卡开关（默认开）
+ACTIVITY_ENABLED = (os.environ.get("WB_CHECKIN_ACTIVITY") or "1").strip().lower() not in ("0", "false", "no")
+ACP_TIMEOUT = 60
 
 
 # ------------------------------------------------------------------
@@ -149,7 +162,7 @@ def summary(line):
 
 def write_result(overall, title, accounts):
     """把多账号签到结果落盘（JSON）给邮件 step 读。
-    accounts: [{"name","uid","status","title","detail"}]，status ∈ ok/already/inactive/expired/failed"""
+    accounts: [{"name","uid","status","title","detail","activity"}]，status ∈ ok/already/inactive/expired/failed"""
     data = {"overall": overall, "title": title, "accounts": accounts}
     with open(RESULT_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -157,6 +170,205 @@ def write_result(overall, title, accounts):
     if p:
         with open(p, "a", encoding="utf-8") as f:
             f.write("status=%s\ntitle=%s\n" % (overall, title))
+
+
+# ------------------------------------------------------------------
+# 连登打卡（活跃上报）—— 完成一次对话才算当天活跃，移植自本地 do_activate
+# ------------------------------------------------------------------
+
+def _host_list(token):
+    hosts = []
+    iss = token_issuer_origin(token)
+    if iss:
+        hosts.append(iss)
+    hosts += FALLBACK_HOSTS
+    return list(dict.fromkeys(hosts))
+
+
+def _web_headers(token, uid, origin, referer_path="/profile/growth-center"):
+    return {
+        "Accept": "application/json, text/plain, */*",
+        "Origin": origin,
+        "Referer": origin + referer_path,
+        "Authorization": "Bearer " + token,
+        "X-Client-Platform": "web",
+        "X-User-Id": uid,
+        "User-Agent": UA,
+    }
+
+
+def _http_get(url, headers, timeout=20):
+    parsed = urllib.parse.urlsplit(url)
+    conn = http.client.HTTPSConnection(parsed.netloc, timeout=timeout,
+                                       context=ssl.create_default_context())
+    try:
+        path = parsed.path + ("?" + parsed.query if parsed.query else "")
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8", "replace")
+    finally:
+        conn.close()
+
+
+def heatmap_today(host, token, uid):
+    """查成长中心今日活跃。返回 today dict（含 is_active）或 None。"""
+    url = host + "/activity/growth/heatmap"
+    o = urllib.parse.urlsplit(url)
+    headers = _web_headers(token, uid, o.scheme + "://" + o.netloc)
+    try:
+        st, obj = _http_get(url, headers)
+    except Exception:
+        return None
+    if st != 200 or not isinstance(obj, dict):
+        return None
+    return (obj.get("data") or {}).get("today") or None
+
+
+def _acp_fire(endpoint, runtime_token, sess_id):
+    """ACP 握手：SSE GET 拿 connection-id → initialize → session/prompt（发一句即算对话）→ DELETE 收尾。"""
+    p = urllib.parse.urlsplit(endpoint)
+    host, path = p.netloc, p.path or "/"
+    base_hdr = {
+        "Origin": "https://" + host,
+        "Referer": "https://" + host + "/",
+        "Authorization": "Bearer " + runtime_token,
+        "User-Agent": UA,
+    }
+    # 1) SSE 长连接（保持打开，让 connection-id 生效）
+    c1 = http.client.HTTPSConnection(host, timeout=ACP_TIMEOUT, context=ssl.create_default_context())
+    hdr1 = dict(base_hdr)
+    hdr1["Accept"] = "text/event-stream"
+    c1.request("GET", path, headers=hdr1)
+    r1 = c1.getresponse()
+    if r1.status != 200:
+        c1.close()
+        raise RuntimeError("ACP SSE HTTP %s" % r1.status)
+    conn_id = r1.getheader("acp-connection-id") or ""
+
+    rpc_n = [0]
+
+    def rpc(method, params, timeout=ACP_TIMEOUT):
+        rpc_n[0] += 1
+        body = json.dumps({"jsonrpc": "2.0", "id": rpc_n[0], "method": method, "params": params})
+        h2 = dict(base_hdr)
+        h2.update({
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(body.encode("utf-8"))),
+        })
+        if conn_id:
+            h2["acp-connection-id"] = conn_id
+        c2 = http.client.HTTPSConnection(host, timeout=timeout, context=ssl.create_default_context())
+        try:
+            c2.request("POST", path, body=body.encode("utf-8"), headers=h2)
+            r2 = c2.getresponse()
+            buf = b""
+            try:
+                while True:
+                    chunk = r2.read(1024)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if b'"result"' in buf or b'"error"' in buf:
+                        break
+            except Exception:
+                pass
+            return buf.decode("utf-8", "replace")[:400]
+        finally:
+            c2.close()
+
+    try:
+        rpc("initialize", {
+            "protocolVersion": 1,
+            "clientInfo": {"name": "wb-checkin", "version": "3.0"},
+            "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}},
+        })
+        out = rpc("session/prompt", {"sessionId": sess_id,
+                                     "prompt": [{"type": "text", "text": "你好"}]})
+    finally:
+        # 收尾：DELETE 会话 + 关 SSE（都 best-effort）
+        try:
+            c3 = http.client.HTTPSConnection(host, timeout=10, context=ssl.create_default_context())
+            c3.request("DELETE", path, headers=base_hdr)
+            c3.getresponse().read()
+            c3.close()
+        except Exception:
+            pass
+        try:
+            c1.close()
+        except Exception:
+            pass
+    return out
+
+
+def activity_one(acct):
+    """连登打卡：查 heatmap → 已活跃跳过 → 否则建最小会话上报。
+    返回 (status, title, detail)。status ∈ ok/already/failed"""
+    if not ACTIVITY_ENABLED:
+        return ("ok", "🔥 连登打卡：未启用（WB_CHECKIN_ACTIVITY=0）", "")
+    token, uid = acct["token"], acct["uid"]
+    last_err = ""
+    for host in _host_list(token):
+        # 1) 今日已活跃 → 跳过（幂等，不耗积分）
+        today = None
+        try:
+            today = heatmap_today(host, token, uid)
+        except Exception as e:
+            last_err = "heatmap 异常: %s" % e
+        if isinstance(today, dict) and today.get("is_active") is True:
+            return ("already", "🔥 连登打卡 ✅（今日已活跃，跳过）", "")
+        # 2) 建最小会话
+        o = urllib.parse.urlsplit(host)
+        origin = o.scheme + "://" + o.netloc
+        headers = _web_headers(token, uid, origin)
+        headers["X-CodeBuddy-Request"] = "1"
+        try:
+            st, created = http_post_json(origin + "/console/as/conversations/",
+                                         headers, {"prompt": "你好", "model": "deepseek-r1", "plugins": []},
+                                         timeout=30)
+        except Exception as e:
+            last_err = "建会话异常: %s" % e
+            continue
+        if st in (401, 403):
+            return ("failed", "🔥 连登打卡 ❌：token 失效（HTTP %s）" % st, "活跃上报被 401/403 拒绝")
+        if not isinstance(created, dict):
+            last_err = "建会话非JSON HTTP %s" % st
+            continue
+        data = created.get("data") or {}
+        conv = (created.get("id") or created.get("conversationId")
+                or data.get("id") or data.get("conversationId")
+                or (created.get("info") or {}).get("id"))
+        if not conv:
+            last_err = "建会话失败: %s %s" % (st, str(created)[:160])
+            continue
+        session = created.get("session") or data.get("session")
+        if not session or not session.get("token"):
+            try:
+                st2, txt2 = _http_get(origin + "/console/as/conversations/%s/session" % conv, headers)
+                obj2 = json.loads(txt2) if txt2 else {}
+            except Exception as e:
+                last_err = "取 session 异常: %s" % e
+                continue
+            d2 = (obj2.get("data") or {}) if isinstance(obj2, dict) else {}
+            session = (obj2.get("session") if isinstance(obj2, dict) else None) \
+                or d2.get("session") or d2 or {}
+        link = session.get("link") or session.get("endpoint") or session.get("url") or ""
+        runtime_token = session.get("token") or session.get("accessToken") or session.get("access_token") or ""
+        sess_id = session.get("sessionId") or session.get("session_id") or session.get("id") or conv
+        if not link or not runtime_token:
+            last_err = "会话响应缺 ACP 凭证: %s" % json.dumps(session, ensure_ascii=False)[:160]
+            continue
+        endpoint = link.replace("http://", "https://").rstrip("/")
+        if "acp" not in endpoint:
+            endpoint = endpoint.rstrip("/") + "/api/v1/acp"
+        # 3) ACP 发一句
+        try:
+            _acp_fire(endpoint, runtime_token, sess_id)
+        except Exception as e:
+            last_err = "ACP 异常: %s" % e
+            continue
+        return ("ok", "🔥 连登打卡 ✅（最小会话已发起）", "会话 %s… 已上报" % str(conv)[:8])
+    return ("failed", "🔥 连登打卡 ❌：%s" % (last_err or "全部端点失败"), last_err)
 
 
 # ------------------------------------------------------------------
@@ -182,13 +394,9 @@ def _parse_endtime(v):
 
 def fetch_credits(token, uid):
     """调 get-user-resource。返回 dict: {ok, pool_sum, server_total, pool_count, pools, err}"""
-    hosts = []
-    iss = token_issuer_origin(token)
-    if iss:
-        hosts.append(iss)
-    hosts += FALLBACK_HOSTS
+    hosts = _host_list(token)
     last = "无可用端点"
-    for host in dict.fromkeys(hosts):
+    for host in hosts:
         url = host + CREDITS_PATH
         o = urllib.parse.urlsplit(url)
         origin = o.scheme + "://" + o.netloc
@@ -331,15 +539,11 @@ def do_credits_report():
 def checkin_one(acct):
     """对单个账号签到，返回 (status, title, detail)。status ∈ ok/already/inactive/expired/failed"""
     token, uid = acct["token"], acct["uid"]
-    hosts = []
-    iss = token_issuer_origin(token)
-    if iss:
-        hosts.append(iss)
-    hosts += FALLBACK_HOSTS
+    hosts = _host_list(token)
 
     tried_expired = False
     last_line = ""
-    for host in dict.fromkeys(hosts):
+    for host in hosts:
         for pth in CHECKIN_PATHS:
             url = host + pth
             o = urllib.parse.urlsplit(url)
@@ -400,7 +604,13 @@ def do_checkin():
     for a in accounts:
         print("=== 账号 %s (uid %s) ===" % (a["name"], a["uid"][:8]))
         st, ti, de = checkin_one(a)
-        results.append({"name": a["name"], "uid": a["uid"], "status": st, "title": ti, "detail": de})
+        # 连登打卡（紧跟签到；失败不影响签到结论）
+        ast, ati, ade = activity_one(a)
+        print("  ", ati)
+        results.append({"name": a["name"], "uid": a["uid"], "status": st,
+                        "title": "%s · %s" % (ti, ati), "detail": de,
+                        "activity": ast, "activity_title": ati,
+                        "activity_detail": ade})
 
     statuses = [r["status"] for r in results]
     if all(s == "expired" for s in statuses):
@@ -413,6 +623,10 @@ def do_checkin():
         overall, otitle = "ok", "✅ 全部签到成功"
     else:
         overall, otitle = "already", "☑️ 今日已签到"
+
+    act_all_ok = all(r.get("activity") in ("ok", "already") for r in results)
+    if ACTIVITY_ENABLED:
+        otitle = otitle + (" · 连登✅" if act_all_ok else " · 连登❌")
 
     write_result(overall, otitle, results)
     summary("### WorkBuddy 签到 %s\n\n%s" % (
