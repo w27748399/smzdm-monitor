@@ -551,8 +551,17 @@ def _send_limit_email(now_bj, pair, label, to_list=None, tag=""):
         return False
 
 
+def _limit_slot(h):
+    """提醒档位：限行日 7-19 时按 4 小时一档 -> 07/11/15/19；窗口外返回 None。
+    档内迟到补跑归到档首，既不重发也不漏档（GitHub runner 延迟兼容）。"""
+    if h < 7 or h > 19:
+        return None
+    return 7 + (h - 7) // 4 * 4
+
+
 def limit_reminder_tick(now_bj=None):
-    """每个轮次调用。限行日 7-19 时每小时一封；当天迟到的首跑也会补发一条。
+    """每个轮次调用。限行日 7-19 时每 4 小时一封（07/11/15/19 四档，2026-10-20 由每小时改为每4小时）；
+    当天迟到的首跑也会补发一条。
     支持多组规则（LIMIT_RULES）：每组关注不同尾号、独立去重、独立收件人。
     横幅提醒走 QQ 邮箱 App 通知 / 微信"QQ邮箱提醒"公众号（邮件通道自带，免费无限量）；
     pushplus 实名收费已淘汰（2026-10-14）。"""
@@ -563,12 +572,13 @@ def limit_reminder_tick(now_bj=None):
         return                                  # 周末 / 法定节假日不限行
     digits = set(pair.replace("/", ""))         # '1/6' -> {'1','6'}
     today = d.isoformat()
-    key = "%s-%02d" % (today, h)
-
-    in_window = 7 <= h <= 19
+    slot = _limit_slot(h)
+    in_window = slot is not None
     if in_window:
-        label = "第%d次提醒 %02d:00" % (h - 6, h)
+        key = "%s-%02d" % (today, slot)
+        label = "第%d次提醒 %02d:00" % ((slot - 7) // 4 + 1, slot)
     else:
+        key = "%s-pre%02d" % (today, h)
         label = "出行前预告 %02d:%02d" % (h, now_bj.minute)
 
     rules = _limit_rules()
@@ -581,7 +591,7 @@ def limit_reminder_tick(now_bj=None):
             continue                            # 该组关注的尾号今天不限行
         last = state.get(rule["key"], "")
         if last == key:
-            continue                            # 本组本小时已发
+            continue                            # 本组本档已发
         if not in_window and (last[:10] == today or h > 19):
             continue                            # 时段外：今天已发过 / 已过 19 点不补
         tag = "、".join(sorted(rule["tails"])) if multi else ""
