@@ -99,6 +99,8 @@ jobs:
                  "整体: " + otitle + "\n\n"
           for a in accounts:
             body += "· %s：%s\n" % (a.get("name", "?"), a.get("title", "?"))
+            if a.get("activity_title"):
+              body += "    " + str(a["activity_title"]) + "\n"
             if a.get("status") in ("expired", "failed"):
               body += "    详情: %s\n" % str(a.get("detail", "")).replace("\n", " / ")
           if credits_block:
