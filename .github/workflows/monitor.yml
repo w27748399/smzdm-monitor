@@ -87,6 +87,10 @@ jobs:
           RELAY_PAT: ${{ secrets.RELAY_PAT }}
           # 天津限行提醒的额外同步收件人（Secrets 里存邮箱，避免公开仓库暴露）
           LIMIT_EMAIL_TO: ${{ secrets.LIMIT_EMAIL_TO }}
+          # 多组尾号规则（JSON 数组，必须存 Secrets —— 公开仓库绝不能出现明文邮箱）
+          #   例：[{"tails":"1","to":""},{"tails":"3,6","to":"a@qq.com"}]
+          #   to 留空 = 回退 EMAIL_TO + LIMIT_EMAIL_TO；每组独立去重、独立收件人
+          LIMIT_RULES: ${{ secrets.LIMIT_RULES }}
         # 8400s = 2h20m：比 cron 的 2h 间隔多出 20 分钟重叠。
         # 之前跑 5h（18000s）实测会被 GitHub 提前回收 runner（shutdown signal，
         # run 标 failure），白白浪费 3 小时接力；缩到 2h20m 后：
