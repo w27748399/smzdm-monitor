@@ -40,6 +40,16 @@ jobs:
           GITHUB_STEP_SUMMARY: ${{ env.GITHUB_STEP_SUMMARY }}
         run: python3 wb_checkin.py --credits
 
+      - name: Upload result artifact
+        # 落盘 checkin_result.json（含连登打卡状态），方便网页端随时下载核对
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-result
+          path: checkin_result.json
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: Email daily result
         if: always()
         shell: python
