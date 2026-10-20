@@ -23,17 +23,23 @@ INTERVAL="${POLL_INTERVAL:-60}"
 PY="${PYTHON:-python3}"
 
 # ----------------------------------------------------------------------------
-# 夜间停机窗口（北京时间）：默认 23:00 ~ 次日 08:00 不监控。
-#   - 每轮开始前检查，命中窗口就优雅退出接力（job 提前收工，不硬睡占机时）
-#   - 与 monitor.yml 的 cron 白天点火窗口（0-14 UTC = 北京 8:00-22:30）双保险
-#   - 临时强制监控：ALLOW_NIGHT=1 bash loop.sh
+# 夜间【静默】窗口（北京时间）：默认 23:00 ~ 次日 07:00。
+#   ⚠️ 2026-10-20 重大改动：从"停机"改为"静默"。
+#   历史事故：夜间停机时本棒直接 break 且不 dispatch_relay ⇒ 接力链彻底断开，
+#   早上首棒只能等 cron 点火；而 GitHub cron 凌晨窗口实测延迟 4~6 小时且常被
+#   静默丢弃（10-20 凌晨 22:59 断链 → 01:36 一发迟到废炮撞护栏空跑 → 直到
+#   08:05 才被手动点火救活，7:00 限行首封彻底丢失）。
+#   新策略：夜里照常接力（self-dispatch 走 API，点火必达），但 monitor.py 加
+#   --no-push 只抓不推 ⇒ 夜里不吵、早上 7 点本棒早已在跑 ⇒ 限行提醒必然准点。
+#   注意：limit_reminder_tick() 与 do_push 无关，--no-push 不影响限行邮件。
+#   - 强制全量推送（含夜间）：PUSH_NIGHT=1 bash loop.sh
 # ----------------------------------------------------------------------------
-NIGHT_START="${NIGHT_START:-23}" # 北京时间 >= 该小时 -> 停
-NIGHT_END="${NIGHT_END:-7}"      # 北京时间 <  该小时 -> 不起（7点起：天津限行提醒首封 7 点要发）
-ALLOW_NIGHT="${ALLOW_NIGHT:-0}"
+NIGHT_START="${NIGHT_START:-23}" # 北京时间 >= 该小时 -> 静默（只抓不推）
+NIGHT_END="${NIGHT_END:-7}"      # 北京时间 <  该小时 -> 静默（7点起恢复正常推送）
+PUSH_NIGHT="${PUSH_NIGHT:-0}"    # 1 = 夜间也推送（旧行为）
 
 is_night() {
-    [ "$ALLOW_NIGHT" = "1" ] && return 1
+    [ "$PUSH_NIGHT" = "1" ] && return 1
     local h
     h=$(TZ='Asia/Shanghai' date +%H)
     [ "$h" -ge "$NIGHT_START" ] || [ "$h" -lt "$NIGHT_END" ]
@@ -112,33 +118,33 @@ dispatch_relay() {
 START=$(date +%s)
 END=$((START + DURATION))
 ROUND=0
+QUIET=0
 
 echo "=================================================================="
 echo "长跑接力开始  总时长 ${DURATION}s  轮询间隔 ${INTERVAL}s"
 echo "仓库内回写状态：$([ "$IN_GIT" = "1" ] && echo 是 || echo 否)"
+echo "夜间策略：$( [ "$PUSH_NIGHT" = "1" ] && echo "全量推送（不分昼夜）" || echo "静默接力 ${NIGHT_START}:00~次日${NIGHT_END}:00 只抓不推" )"
 echo "起跑时间：$(date '+%F %T %Z')"
 echo "=================================================================="
 
 while :; do
-    # 夜间停机：命中窗口就收工退出（下一次白天 cron 点火自然接上）
-    if is_night; then
-        echo ""
-        echo "=================================================================="
-        echo "🌙 夜间停机：北京时间 $(TZ='Asia/Shanghai' date '+%F %T')，"
-        echo "   停机窗口 ${NIGHT_START}:00 ~ 次日 ${NIGHT_END}:00（北京时间）不监控。"
-        echo "   本接力共完成 $ROUND 轮，提前收工。"
-        echo "=================================================================="
-        break
-    fi
+    # 夜间只降级为"静默"，绝不退出 —— 退出就等于把接力链掐断，
+    # 早上只能干等 cron（凌晨 cron 实测延迟 4~6h，基本等于没有）。
+    if is_night; then QUIET=1; else QUIET=0; fi
 
     NOW=$(date +%s)
     [ "$NOW" -ge "$END" ] && break
 
     ROUND=$((ROUND + 1))
-    echo "── 轮次 $ROUND  $(date '+%F %T') ──"
+    echo "── 轮次 $ROUND  $(date '+%F %T')  $([ "$QUIET" = "1" ] && echo '🌙 夜间静默（只抓不推）') ──"
 
     # 单轮：抓取 -> 解析 -> 去重 -> 推送 -> 写状态
-    "$PY" monitor.py --once || echo "  ! 本轮执行异常，继续下一轮"
+    # 夜间加 --no-push：仍会 seen.append 标记已读，早上不补推、不轰炸
+    if [ "$QUIET" = "1" ]; then
+        "$PY" monitor.py --once --no-push || echo "  ! 本轮执行异常，继续下一轮"
+    else
+        "$PY" monitor.py --once || echo "  ! 本轮执行异常，继续下一轮"
+    fi
 
     commit_state
 
@@ -152,16 +158,15 @@ while :; do
 done
 
 echo "=================================================================="
-# 收尾补抓只在白天做；夜间退出就不补（不违反停机窗口）
-if is_night; then
-    echo "接力区间结束（共 $ROUND 轮），夜间停机不补抓"
-    echo "🌙 夜间停机，不续接力（明早 ${NIGHT_END}:00 由 cron 恢复）"
+echo "接力区间结束（共 $ROUND 轮），收尾再抓一次"
+if [ "$QUIET" = "1" ]; then
+    "$PY" monitor.py --once --no-push >/dev/null 2>&1 || true
 else
-    echo "接力区间结束（共 $ROUND 轮），收尾再抓一次"
     "$PY" monitor.py --once >/dev/null 2>&1 || true
-    commit_state
-    # 亲手点火下一棒（夜间不点）
-    dispatch_relay
 fi
+commit_state
+# 🔴 无论昼夜都必须续接力：夜间断链 = 早上没有本棒在跑 = 限行首封必丢
+#    （2026-10-20 事故根因：夜间停机时这里不 dispatch，早上只能干等延迟 4~6h 的 cron）
+dispatch_relay
 echo "退出时间：$(TZ='Asia/Shanghai' date '+%F %T') 北京时间 / $(date '+%F %T %Z')"
 echo "=================================================================="
