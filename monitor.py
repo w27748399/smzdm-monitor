@@ -80,8 +80,13 @@ _DEFAULTS = {
     "SMTP_PORT": "",                        # 留空则自动（SSL 465 / STARTTLS 587）
     "SMTP_SSL": "",                         # 留空自动；"0" 强制 STARTTLS，"1" 强制 SSL
     # --- 天津尾号限行提醒（附加功能，随监控链每轮顺带检查）---
-    "LIMIT_TAIL": "1",                      # 关注的尾号
-    "LIMIT_EMAIL_TO": "",                   # 限行提醒额外同步的收件邮箱
+    "LIMIT_TAIL": "1",                      # 关注的尾号（单组旧配置，保留兼容）
+    "LIMIT_EMAIL_TO": "",                   # 限行提醒额外同步的收件邮箱（单组旧配置）
+    # 多组规则（推荐）：JSON 数组，每组独立判断、独立去重、独立收件人
+    #   例：[{"tails":"1","to":""},{"tails":"3,6","to":"a@qq.com,b@qq.com"}]
+    #   to 留空 = 回退 EMAIL_TO + LIMIT_EMAIL_TO；tails 支持逗号/斜杠/顿号分隔
+    #   ⚠️ 公开仓库里必须存 Secrets，不要写进 workflow 明文
+    "LIMIT_RULES": "",
 }
 
 
@@ -370,6 +375,7 @@ def _send_email(item):
 # ⚠️ 2027 节假日官方安排公布后，需同步更新 _LIMIT_HOLIDAYS（与单一数据源同步改）。
 LIMIT_TAIL = (CFG.get("LIMIT_TAIL") or "1").strip()
 LIMIT_EMAIL_TO = (CFG.get("LIMIT_EMAIL_TO") or "").strip()
+LIMIT_RULES_RAW = (CFG.get("LIMIT_RULES") or "").strip()
 LIMIT_STATE_PATH = os.path.join(BASE_DIR, "limit_state.json")
 
 _LIMIT_ANCHOR = date(2026, 6, 29)   # 组0 周一 = 1/6
@@ -407,18 +413,67 @@ def _limit_period_rows(d):
             for i in range(5)]
 
 
+def _parse_tails(s):
+    """'3,6' / '1/6' / '3、6' -> {'3','6'}"""
+    return {t for t in re.split(r"[,/、，\s]+", str(s or "")) if t.strip()}
+
+
+def _limit_rules():
+    """解析限行提醒规则组，返回 [{key, tails:set, to:list}]。
+
+    优先用 LIMIT_RULES（JSON）；没配则回退到老的 LIMIT_TAIL + EMAIL_TO/LIMIT_EMAIL_TO，
+    保证老部署在没改配置前行为完全不变。
+    """
+    rules = []
+    if LIMIT_RULES_RAW:
+        try:
+            data = json.loads(LIMIT_RULES_RAW)
+            if isinstance(data, dict):
+                data = data.get("rules") or []
+            for i, r in enumerate(data):
+                if isinstance(r, str):                  # 允许写成纯尾号串
+                    tails_s, to_s = r, ""
+                elif isinstance(r, dict):
+                    tails_s, to_s = r.get("tails", ""), r.get("to", "")
+                else:
+                    continue
+                tails = _parse_tails(tails_s)
+                if not tails:
+                    continue
+                rules.append({
+                    "key": "r%d" % i,
+                    "tails": tails,
+                    "to": [x.strip() for x in str(to_s or "").split(",") if x.strip()],
+                })
+        except Exception as e:
+            log.warning("LIMIT_RULES 解析失败（%s），回退到 LIMIT_TAIL", e)
+            rules = []
+    if not rules:
+        tails = _parse_tails(LIMIT_TAIL) or {"1"}
+        rules = [{"key": "r0", "tails": tails, "to": []}]
+    return rules
+
+
 def _limit_state_load():
+    """返回 {rule_key: 'YYYY-MM-DD-HH'}；兼容老格式 {"last": "..."} -> {"r0": ...}"""
     try:
         with open(LIMIT_STATE_PATH, "r", encoding="utf-8") as f:
-            return (json.load(f) or {}).get("last", "")
+            obj = json.load(f) or {}
     except Exception:
-        return ""
+        return {}
+    rules = obj.get("rules")
+    if isinstance(rules, dict):
+        return dict(rules)
+    last = obj.get("last")
+    if isinstance(last, str) and last:
+        return {"r0": last}
+    return {}
 
 
-def _limit_state_save(v):
+def _limit_state_save(state):
     tmp = LIMIT_STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"last": v, "updated": now_str()}, f, ensure_ascii=False)
+        json.dump({"rules": state, "updated": now_str()}, f, ensure_ascii=False)
     os.replace(tmp, LIMIT_STATE_PATH)
 
 
@@ -431,16 +486,17 @@ def _smtp_endpoint():
     return _SMTP_TABLE.get(domain, ("", 465, True))
 
 
-def _send_limit_email(now_bj, pair, label):
-    """发限行提醒邮件：收件人 = EMAIL_TO + LIMIT_EMAIL_TO。"""
+def _send_limit_email(now_bj, pair, label, to_list=None, tag=""):
+    """发限行提醒邮件。to_list 为空时回退 EMAIL_TO + LIMIT_EMAIL_TO。"""
     user = (CFG["EMAIL_USER"] or "").strip()
     password = (CFG["EMAIL_PASS"] or "").strip()
     if not user or not password:
         log.warning("限行提醒失败：EMAIL_USER / EMAIL_PASS 未配置")
         return False
-    to_list = [x.strip() for x in
-               ((CFG["EMAIL_TO"] or "") + "," + LIMIT_EMAIL_TO).split(",")
-               if x.strip()] or [user]
+    if not to_list:
+        to_list = [x.strip() for x in
+                   ((CFG["EMAIL_TO"] or "") + "," + LIMIT_EMAIL_TO).split(",")
+                   if x.strip()] or [user]
     host, port, use_ssl = _smtp_endpoint()
     if not host:
         log.warning("限行提醒失败：无法确定 SMTP 服务器")
@@ -450,6 +506,8 @@ def _send_limit_email(now_bj, pair, label):
     tails = pair.split("/")
     subject = "🚗 今日限行尾号%s（周%s）· %s" % (
         "/".join(tails), wd, label)
+    if tag:                                     # 多组规则时标明这封是给哪组尾号的
+        subject += " · 你的尾号 %s" % tag
     rows = _limit_period_rows(now_bj.date())
     tr = "".join(
         '<tr style="background:%s"><td style="padding:4px 14px">周%s</td>'
@@ -495,33 +553,43 @@ def _send_limit_email(now_bj, pair, label):
 
 def limit_reminder_tick(now_bj=None):
     """每个轮次调用。限行日 7-19 时每小时一封；当天迟到的首跑也会补发一条。
+    支持多组规则（LIMIT_RULES）：每组关注不同尾号、独立去重、独立收件人。
     横幅提醒走 QQ 邮箱 App 通知 / 微信"QQ邮箱提醒"公众号（邮件通道自带，免费无限量）；
     pushplus 实名收费已淘汰（2026-10-14）。"""
     now_bj = now_bj or datetime.now(CST)
     d, h = now_bj.date(), now_bj.hour
     pair = _limit_pair(d)
-    if not pair or LIMIT_TAIL not in pair.replace("/", ""):
-        return                                  # 今天不限目标尾号（两位都查，'1/6' 含尾号1）
-
-    last = _limit_state_load()
+    if not pair:
+        return                                  # 周末 / 法定节假日不限行
+    digits = set(pair.replace("/", ""))         # '1/6' -> {'1','6'}
     today = d.isoformat()
     key = "%s-%02d" % (today, h)
-    if last == key:
-        return                                  # 本小时已发
-    in_window = 7 <= h <= 19
-    if not in_window and (last[:10] == today or h > 19):
-        return                                  # 时段外：今天已发过 / 已过 19 点不补
 
+    in_window = 7 <= h <= 19
     if in_window:
         label = "第%d次提醒 %02d:00" % (h - 6, h)
     else:
         label = "出行前预告 %02d:%02d" % (h, now_bj.minute)
-    emailed = _send_limit_email(now_bj, pair, label)
-    if emailed:
-        wd = "一二三四五六日"[now_bj.weekday()]
-        _limit_state_save(key)
-        log.info("限行提醒已记录（%s，尾号%s 限行，email=OK 周%s）",
-                 key, LIMIT_TAIL, wd)
+
+    rules = _limit_rules()
+    multi = len(rules) > 1                      # 多组时才在主题里标尾号，单组保持原样
+    state = _limit_state_load()
+    wd = "一二三四五六日"[now_bj.weekday()]
+
+    for rule in rules:
+        if not (rule["tails"] & digits):
+            continue                            # 该组关注的尾号今天不限行
+        last = state.get(rule["key"], "")
+        if last == key:
+            continue                            # 本组本小时已发
+        if not in_window and (last[:10] == today or h > 19):
+            continue                            # 时段外：今天已发过 / 已过 19 点不补
+        tag = "、".join(sorted(rule["tails"])) if multi else ""
+        if _send_limit_email(now_bj, pair, label, rule["to"] or None, tag):
+            state[rule["key"]] = key
+            _limit_state_save(state)
+            log.info("限行提醒已记录（%s 规则%s 尾号%s 命中 %s，email=OK 周%s）",
+                     key, rule["key"], tag or "-", pair, wd)
 
 
 # ────────────────────── 健康检查 HTTP 服务 ──────────────────────
@@ -630,8 +698,17 @@ def main():
     if "--test-limit" in args:
         now_bj = datetime.now(CST)
         pair = _limit_pair(now_bj.date()) or "5/0"
-        ok = _send_limit_email(now_bj, pair, "测试邮件（模拟尾号%s限行日）" % LIMIT_TAIL)
-        log.info("限行提醒测试邮件：%s", "已发送" if ok else "失败")
+        rules = _limit_rules()
+        multi = len(rules) > 1
+        ok_all = True
+        for rule in rules:
+            tag = "、".join(sorted(rule["tails"])) if multi else ""
+            ok = _send_limit_email(now_bj, pair, "测试邮件（模拟限行日）",
+                                   rule["to"] or None, tag)
+            log.info("限行提醒测试[规则%s 尾号%s]：%s",
+                     rule["key"], tag or "-", "已发送" if ok else "失败")
+            ok_all = ok_all and ok
+        log.info("限行提醒测试邮件：%s", "全部成功" if ok_all else "有失败")
         return
 
     seen, initialized = load_state()
