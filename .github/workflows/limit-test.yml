@@ -1,0 +1,45 @@
+name: 限号提醒测试（手动）
+
+# 独立的测试通道：只把限行提醒测试邮件逐组发一遍，然后退出。
+# 为什么单独开一个 workflow：主 workflow 有 concurrency 组 xxt-monitor，
+# 手动触发会被排在正在跑的长跑接力后面（最多等 2h20m）才能执行；
+# 这里不设 concurrency，点一下立即跑，几秒钟结束。
+#
+# 用途：改了 LIMIT_RULES（尾号 / 收件人）之后，验证每一组都能正常发信。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 拉取仓库
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 发限号测试邮件（按规则逐组发送）
+        env:
+          PYTHONUNBUFFERED: '1'
+          PYTHONIOENCODING: 'utf-8'
+          NO_HEALTH_SERVER: '1'
+          # 邮件通道
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_SSL: ${{ secrets.SMTP_SSL }}
+          # 限行提醒规则
+          LIMIT_EMAIL_TO: ${{ secrets.LIMIT_EMAIL_TO }}
+          LIMIT_RULES: ${{ secrets.LIMIT_RULES }}
+        run: python monitor.py --test-limit
