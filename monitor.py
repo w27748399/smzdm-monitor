@@ -709,6 +709,21 @@ def main():
         now_bj = datetime.now(CST)
         pair = _limit_pair(now_bj.date()) or "5/0"
         rules = _limit_rules()
+        # --only <邮箱>：只测命中这个收件人的规则组（不打扰其它收件人）
+        only = ""
+        if "--only" in args:
+            _i = args.index("--only")
+            if _i + 1 < len(args):
+                only = args[_i + 1].strip()
+        if only:
+            hit = [r for r in rules if only in r["to"]]
+            if not hit:
+                log.error("没有规则指向 %s，未发送。当前规则：%s", only,
+                          [(r["key"], ",".join(sorted(r["tails"])),
+                            ",".join(r["to"]) or "(回退默认收件人)") for r in rules])
+                return
+            rules = hit
+            log.info("仅测试收件人 %s（命中 %d 组规则）", only, len(hit))
         multi = len(rules) > 1
         ok_all = True
         for rule in rules:

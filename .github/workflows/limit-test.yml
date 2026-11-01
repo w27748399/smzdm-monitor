@@ -9,6 +9,11 @@ name: 限号提醒测试（手动）
 
 on:
   workflow_dispatch:
+    inputs:
+      only:
+        description: '只测这个收件邮箱（留空 = 按 LIMIT_RULES 逐组全测）'
+        required: false
+        default: ''
 
 jobs:
   test:
@@ -42,4 +47,11 @@ jobs:
           # 限行提醒规则
           LIMIT_EMAIL_TO: ${{ secrets.LIMIT_EMAIL_TO }}
           LIMIT_RULES: ${{ secrets.LIMIT_RULES }}
-        run: python monitor.py --test-limit
+          ONLY_TO: ${{ inputs.only }}
+        run: |
+          if [ -n "$ONLY_TO" ]; then
+            echo "仅测试收件人：$ONLY_TO"
+            python monitor.py --test-limit --only "$ONLY_TO"
+          else
+            python monitor.py --test-limit
+          fi
