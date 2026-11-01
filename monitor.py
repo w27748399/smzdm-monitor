@@ -709,6 +709,7 @@ def main():
         now_bj = datetime.now(CST)
         pair = _limit_pair(now_bj.date()) or "5/0"
         rules = _limit_rules()
+        multi = len(rules) > 1                   # 多组时主题标尾号（按过滤前组数算，--only 也保留）
         # --only <邮箱>：只测命中这个收件人的规则组（不打扰其它收件人）
         only = ""
         if "--only" in args:
@@ -724,7 +725,6 @@ def main():
                 return
             rules = hit
             log.info("仅测试收件人 %s（命中 %d 组规则）", only, len(hit))
-        multi = len(rules) > 1
         ok_all = True
         for rule in rules:
             tag = "、".join(sorted(rule["tails"])) if multi else ""
