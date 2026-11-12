@@ -18,9 +18,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Refresh tokens near expiry
+        # accessToken 剩余 <REFRESH_WITHIN_DAYS 天时，用 refreshToken 换新并写回 Secret。
+        # 产物落 runner.temp/wb_accounts.json，后续 step 走文件读（新 token 不进 env，避免日志泄露）。
+        # 本步失败不阻断签到：旧 token 可能仍然有效，宁可先签上。
+        continue-on-error: true
+        env:
+          WB_CHECKIN_ACCOUNTS: ${{ secrets.WB_CHECKIN_ACCOUNTS }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          WB_CHECKIN_ACCOUNTS_OUT: ${{ runner.temp }}/wb_accounts.json
+          REFRESH_WITHIN_DAYS: "7"
+        run: |
+          python3 -m pip install --quiet --disable-pip-version-check pynacl \
+            || echo "::warning::pynacl 安装失败，自动续期将只刷新不写回"
+          python3 wb_refresh.py
+
       - name: Do checkin
         id: checkin
         env:
+          # 续期 step 产出的账号文件（含轮换后的新 token），优先于下面的 Secret
+          WB_CHECKIN_ACCOUNTS_FILE: ${{ runner.temp }}/wb_accounts.json
           # 多账号：JSON 数组，脚本内部逐账号签到
           WB_CHECKIN_ACCOUNTS: ${{ secrets.WB_CHECKIN_ACCOUNTS }}
           # 回退（旧单账号配置，WB_CHECKIN_ACCOUNTS 缺失时生效）
@@ -34,6 +52,7 @@ jobs:
         if: always()
         continue-on-error: true
         env:
+          WB_CHECKIN_ACCOUNTS_FILE: ${{ runner.temp }}/wb_accounts.json
           WB_CHECKIN_ACCOUNTS: ${{ secrets.WB_CHECKIN_ACCOUNTS }}
           WB_CHECKIN_TOKEN: ${{ secrets.WB_CHECKIN_TOKEN }}
           WB_CHECKIN_UID: ${{ secrets.WB_CHECKIN_UID }}
