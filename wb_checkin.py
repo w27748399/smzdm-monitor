@@ -75,9 +75,21 @@ ACP_TIMEOUT = 60
 # ------------------------------------------------------------------
 
 def load_accounts():
-    """返回 [{"name","token","uid"}]。优先 WB_CHECKIN_ACCOUNTS(JSON)，否则回退单账号 env。"""
+    """返回 [{"name","token","uid"}]。优先级：WB_CHECKIN_ACCOUNTS_FILE（续期 step 产出，
+    token 走文件不进 env 避免日志泄露）> WB_CHECKIN_ACCOUNTS(JSON) > 单账号 env。"""
     out = []
-    raw = (os.environ.get("WB_CHECKIN_ACCOUNTS") or "").strip()
+    fpath = (os.environ.get("WB_CHECKIN_ACCOUNTS_FILE") or "").strip()
+    raw = ""
+    if fpath and os.path.exists(fpath):
+        try:
+            with open(fpath, encoding="utf-8") as f:
+                fd = json.load(f)
+            raw = json.dumps(fd.get("accounts") if isinstance(fd, dict) else fd,
+                             ensure_ascii=False)
+        except Exception as e:
+            print("! WB_CHECKIN_ACCOUNTS_FILE 读取失败（回退 env）:", e)
+    if not raw:
+        raw = (os.environ.get("WB_CHECKIN_ACCOUNTS") or "").strip()
     if raw:
         try:
             arr = json.loads(raw)
