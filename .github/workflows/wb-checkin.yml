@@ -5,6 +5,11 @@ on:
     # UTC 01:20 / 13:20 = 北京时间 09:20 / 21:20，一天两次，幂等
     - cron: '20 1,13 * * *'
   workflow_dispatch:
+    inputs:
+      refresh_within_days:
+        description: "强制续期阈值（天）。默认 7；填 30 可强制刷新以验证续期链路"
+        required: false
+        default: "7"
 
 concurrency:
   group: wb-checkin
@@ -28,7 +33,7 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           WB_CHECKIN_ACCOUNTS_OUT: ${{ runner.temp }}/wb_accounts.json
-          REFRESH_WITHIN_DAYS: "7"
+          REFRESH_WITHIN_DAYS: ${{ inputs.refresh_within_days || '7' }}
         run: |
           python3 -m pip install --quiet --disable-pip-version-check pynacl \
             || echo "::warning::pynacl 安装失败，自动续期将只刷新不写回"
