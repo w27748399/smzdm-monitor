@@ -132,6 +132,15 @@ PRICE_RE = re.compile(
 # 备用：某些情况下 class 写法变化
 PRICE_RE2 = re.compile(r'/p/(\d+)/"[^>]*class="price[^"]*"[^>]*>(.*?)</a>')
 
+# ⚠️ 2026-11-22 兜底：爆料页改版为内嵌 JSON-LD（schema.org ItemList，
+# head 里 "url":"https://www.smzdm.com/p/ID/","name":"标题"），老 HTML 正则
+# 命中 0 条 → 静默瞎了 5 天（11-17~11-22，9 条线报漏推，见事故六复盘）。
+# 新结构里 position 1 = 最新，顺序即新->旧；name 为 JSON 字符串，可能含
+# \" 转义，用 json.loads 还原。价格字段 JSON-LD 里没有，留空不影响推送。
+ITEM_JSON_RE = re.compile(
+    r'"url":"https://www\.smzdm\.com/p/(\d{7,12})/","name":"((?:[^"\\]|\\.)*)"'
+)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -226,6 +235,26 @@ def parse(page):
             "price": prices.get(pid, ""),
             "url": "https://www.smzdm.com/p/%s/" % pid,
         })
+    if not items:
+        # ⚠️ 2026-11-22 兜底：页面改版（JSON-LD ItemList）后老正则命中 0 条，
+        # 曾静默瞎 5 天。老结构是主路径，解析为空时走 JSON-LD 兜底，双保险。
+        seen_ids = set()
+        for pid, name in ITEM_JSON_RE.findall(page):
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            try:
+                title = json.loads('"%s"' % name)  # 还原 \uXXXX / \" 转义
+            except Exception:
+                title = name
+            items.append({
+                "id": pid,
+                "title": html.unescape(title).strip(),
+                "price": "",
+                "url": "https://www.smzdm.com/p/%s/" % pid,
+            })
+        if items:
+            log.info("老结构命中 0 条，JSON-LD 兜底解析 %d 条", len(items))
     return items
 
 
